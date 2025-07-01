@@ -365,27 +365,78 @@ class EnhancedPDFProcessor:
 class VertexAIEmbeddings:
     """Custom embeddings class using VertexGenAI."""
     
-    def __init__(self, vertex_gen_ai: VertexGenAI):
+    def __init__(self, vertex_gen_ai: VertexGenAI, model_name: str = "text-embedding-004"):
         self.vertex_gen_ai = vertex_gen_ai
+        self.model_name = model_name
+        self._embedding_dimension = None
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Embed multiple documents."""
-        embeddings = []
-        for text in texts:
-            embedding = self.vertex_gen_ai.get_embeddings()
-            if embedding and len(embedding) > 0:
-                embeddings.append(embedding[0].values)
-            else:
-                # Return a zero vector if embedding fails
-                embeddings.append([0.0] * 768)  # Assuming 768-dimensional embeddings
-        return embeddings
+        if not texts:
+            return []
+            
+        try:
+            # Get embeddings from VertexGenAI
+            embeddings_response = self.vertex_gen_ai.get_embeddings(texts, self.model_name)
+            
+            # Extract vectors from response
+            embeddings = []
+            for embedding in embeddings_response:
+                if hasattr(embedding, 'values'):
+                    embeddings.append(list(embedding.values))
+                else:
+                    # Log warning and use zero vector as fallback
+                    logger.warning(f"Embedding response missing 'values' attribute")
+                    embeddings.append(self._get_zero_vector())
+            
+            # Set embedding dimension if not already set
+            if embeddings and self._embedding_dimension is None:
+                self._embedding_dimension = len(embeddings[0])
+                
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"Error getting embeddings: {str(e)}")
+            # Return zero vectors for all texts
+            return [self._get_zero_vector() for _ in texts]
     
     def embed_query(self, text: str) -> List[float]:
         """Embed a single query."""
-        embedding = self.vertex_gen_ai.get_embeddings()
-        if embedding and len(embedding) > 0:
-            return embedding[0].values
-        return [0.0] * 768
+        if not text:
+            return self._get_zero_vector()
+            
+        try:
+            # Get embedding for single text
+            embeddings_response = self.vertex_gen_ai.get_embeddings([text], self.model_name)
+            
+            if embeddings_response and len(embeddings_response) > 0:
+                embedding = embeddings_response[0]
+                if hasattr(embedding, 'values'):
+                    vector = list(embedding.values)
+                    # Update dimension if needed
+                    if self._embedding_dimension is None:
+                        self._embedding_dimension = len(vector)
+                    return vector
+                    
+            return self._get_zero_vector()
+            
+        except Exception as e:
+            logger.error(f"Error getting query embedding: {str(e)}")
+            return self._get_zero_vector()
+    
+    def _get_zero_vector(self) -> List[float]:
+        """Get a zero vector of appropriate dimension."""
+        # Use stored dimension or default to 768 (common embedding size)
+        dim = self._embedding_dimension if self._embedding_dimension else 768
+        return [0.0] * dim
+
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Async version - just calls sync version for now."""
+        return self.embed_documents(texts)
+    
+    async def aembed_query(self, text: str) -> List[float]:
+        """Async version - just calls sync version for now."""
+        return self.embed_query(text)
 
 class HybridRetriever:
     """Hybrid retrieval system with VertexAI embeddings."""
@@ -511,68 +562,77 @@ class AdvancedRAGSystem:
             for doc in docs:
                 content = doc.page_content
                 metadata = doc.metadata
+                
+                # Include image references if available
+                image_note = ""
+                if metadata.get('image_refs'):
+                    image_note = f"\nImage References: {metadata['image_refs']}"
+                    
                 formatted_doc = f"""
 Document: {metadata.get('source', 'Unknown')}
 Pages: {metadata.get('page_numbers', [])}
-Content: {content}
+Section: {metadata.get('section_info', {})}
+Content: {content}{image_note}
 """
                 formatted.append(formatted_doc)
-            return "\n\n".join(formatted)
+            return "\n\n---\n\n".join(formatted)
         
         def custom_chain(inputs):
-            # Get relevant documents
-            docs = retriever.get_relevant_documents(inputs["question"])
-            
-            # Format context
-            context = format_docs(docs)
-            
-            # Format chat history
-            chat_history = ""
-            for q, a in self.conversation_history[-5:]:  # Last 5 exchanges
-                chat_history += f"Human: {q}\nAssistant: {a}\n\n"
-            
-            # Create prompt
-            prompt = f"""
-You are a precise document assistant with perfect knowledge of the provided document information.
+            try:
+                # Get relevant documents
+                docs = retriever.get_relevant_documents(inputs["question"])
+                
+                # Format context
+                context = format_docs(docs)
+                
+                # Format chat history
+                chat_history = ""
+                for q, a in self.conversation_history[-5:]:  # Last 5 exchanges
+                    chat_history += f"Human: {q}\nAssistant: {a}\n\n"
+                
+                # Create prompt
+                prompt = f"""You are a precise document assistant with perfect knowledge of the provided document information.
 Your goal is to give accurate, thorough answers with exact document and page citations.
 
-Use ONLY the following retrieved context to answer the question. Do not use prior knowledge.
+IMPORTANT RULES:
+1. Use ONLY the information from the retrieved context below to answer the question
+2. Do NOT use any prior knowledge or information not present in the context
+3. If the answer cannot be found in the context, clearly state: "I cannot find information about this in the provided documents."
+4. Provide exact citations for every piece of information
 
-Retrieved information:
+Retrieved Context:
 {context}
 
-Current conversation:
-{chat_history}
+{f"Previous Conversation:{chr(10)}{chat_history}" if chat_history else ""}
 
-User question: {inputs["question"]}
+User Question: {inputs["question"]}
 
-Formatting rules:
-1. Begin EACH distinct piece of information with a citation in this format:
-   [Document: "filename.pdf", Page X-Y] or [Document: "filename.pdf", Page X]
+Citation Format Requirements:
+1. Begin EACH piece of information with: [Document: "filename.pdf", Page X-Y]
+2. Include section if available: [Document: "filename.pdf", Page X, Section Y: "Title"]
+3. For OCR-extracted content: [Document: "filename.pdf", Page X, Image/Figure]
+4. Be extremely specific about page numbers
+5. Never make up or guess page numbers
 
-2. If a section heading or number is available, include it after the page number:
-   [Document: "filename.pdf", Page X, Section Y: "Section Title"]
-
-3. If information comes from OCR-extracted text from images, note it:
-   [Document: "filename.pdf", Page X, Image/Figure]
-
-4. Be extremely precise - only cite pages that directly contain the information.
-
-5. Never make up page numbers or section information.
-
-6. If the question cannot be answered using ONLY the provided context, say: "I cannot find information about this in the documents."
-
-Answer:"""
-            
-            # Generate response using VertexGenAI
-            response = self.vertex_gen_ai.generate_content()
-            
-            # For now, return a simple response structure
-            # In production, you'd parse the actual response from VertexGenAI
-            return {
-                "answer": response if response else "I apologize, but I couldn't generate a response.",
-                "source_documents": docs
-            }
+Answer the question using ONLY the provided context:"""
+                
+                # Generate response using VertexGenAI
+                response_text = self.vertex_gen_ai.generate_content(prompt)
+                
+                if not response_text:
+                    response_text = "I apologize, but I couldn't generate a response. Please try rephrasing your question."
+                
+                return {
+                    "answer": response_text,
+                    "source_documents": docs
+                }
+                
+            except Exception as e:
+                logger.error(f"Error in custom chain: {str(e)}")
+                return {
+                    "answer": f"An error occurred while processing your question: {str(e)}",
+                    "source_documents": []
+                }
         
         return custom_chain
 
@@ -635,134 +695,145 @@ Answer:"""
                 "citation_info": citation_info,
                 "cited_pages": sorted(list(set(all_pages))),
                 "source_docs": source_docs,
-                "relevant_images": relevant_images
-            }
-        except Exception as e:
-            logger.error(f"Error in ask method: {str(e)}")
-            return {
-                "answer": f"Error processing query: {str(e)}",
-                "citation_info": {},
-                "cited_pages": [],
-                "source_docs": [],
-                "relevant_images": []
-            }
+                "relevant"relevant_images": relevant_images
+           }
+       except Exception as e:
+           logger.error(f"Error in ask method: {str(e)}")
+           return {
+               "answer": f"Error processing query: {str(e)}",
+               "citation_info": {},
+               "cited_pages": [],
+               "source_docs": [],
+               "relevant_images": []
+           }
 
-    def _extract_cited_pages(self, text: str) -> Dict[str, List[Dict[str, Any]]]:
-        """Extract citation information from the text."""
-        if not text:
-            return {}
+   def _extract_cited_pages(self, text: str) -> Dict[str, List[Dict[str, Any]]]:
+       """Extract citation information from the text."""
+       if not text:
+           return {}
 
-        citations = {}
+       citations = {}
 
-        # Updated pattern to handle image citations
-        doc_pattern = r'\[Document:\s*"([^"]+)",\s*Page(?:s)?\s*(\d+)(?:-(\d+))?(?:,\s*(?:Section\s*([^:]+):\s*"([^"]+)"|Image/Figure))?\]'
+       # Updated pattern to handle image citations
+       doc_pattern = r'\[Document:\s*"([^"]+)",\s*Page(?:s)?\s*(\d+)(?:-(\d+))?(?:,\s*(?:Section\s*([^:]+):\s*"([^"]+)"|Image/Figure))?\]'
 
-        try:
-            for match in re.finditer(doc_pattern, text):
-                try:
-                    doc_name = match.group(1)
-                    start_page = int(match.group(2))
-                    end_page = int(match.group(3)) if match.group(3) else start_page
-                    pages = list(range(start_page, end_page + 1))
+       try:
+           for match in re.finditer(doc_pattern, text):
+               try:
+                   doc_name = match.group(1)
+                   start_page = int(match.group(2))
+                   end_page = int(match.group(3)) if match.group(3) else start_page
+                   pages = list(range(start_page, end_page + 1))
 
-                    section_num = match.group(4) if match.group(4) else None
-                    section_title = match.group(5) if match.group(5) else None
+                   section_num = match.group(4) if match.group(4) else None
+                   section_title = match.group(5) if match.group(5) else None
 
-                    if doc_name not in citations:
-                        citations[doc_name] = []
+                   if doc_name not in citations:
+                       citations[doc_name] = []
 
-                    citations[doc_name].append({
-                        "pages": pages,
-                        "section_num": section_num,
-                        "section_title": section_title
-                    })
+                   citations[doc_name].append({
+                       "pages": pages,
+                       "section_num": section_num,
+                       "section_title": section_title
+                   })
 
-                except (ValueError, IndexError) as e:
-                    logger.error(f"Error parsing citation: {match.group(0)}, error: {str(e)}")
-                    continue
+               except (ValueError, IndexError) as e:
+                   logger.error(f"Error parsing citation: {match.group(0)}, error: {str(e)}")
+                   continue
 
-            return citations
-        except Exception as e:
-            logger.error(f"Error extracting citations: {str(e)}")
-            return {}
+           return citations
+       except Exception as e:
+           logger.error(f"Error extracting citations: {str(e)}")
+           return {}
 
-    def reset_conversation(self):
-        """Reset the conversation history."""
-        self.conversation_history = []
-        return "Conversation history has been reset."
+   def reset_conversation(self):
+       """Reset the conversation history."""
+       self.conversation_history = []
+       return "Conversation history has been reset."
 
-    def get_document_stats(self) -> Dict[str, Dict[str, Any]]:
-        """Get statistics about uploaded documents."""
-        stats = {}
-        for name, doc in self.documents.items():
-            stats[name] = {
-                "pages": len(doc.pages),
-                "chunks": len(doc.chunks),
-                "total_chars": len(doc.content),
-                "images": len(doc.images),
-                "images_with_ocr": sum(1 for img in doc.images if img.ocr_text)
-            }
-        return stats
+   def get_document_stats(self) -> Dict[str, Dict[str, Any]]:
+       """Get statistics about uploaded documents."""
+       stats = {}
+       for name, doc in self.documents.items():
+           stats[name] = {
+               "pages": len(doc.pages),
+               "chunks": len(doc.chunks),
+               "total_chars": len(doc.content),
+               "images": len(doc.images),
+               "images_with_ocr": sum(1 for img in doc.images if img.ocr_text)
+           }
+       return stats
+
+   def save_index(self, path: str):
+       """Save the FAISS index to disk."""
+       if self.hybrid_retriever:
+           return self.hybrid_retriever.save_index(path)
+       return "No index to save. Please upload documents first."
 
 class GradioRAGInterface:
-    """Gradio interface for the RAG system with image display support."""
+   """Gradio interface for the RAG system with image display support."""
 
-    def __init__(self):
-        self.rag_system = None
-        self.temp_dir = tempfile.mkdtemp()
-        self.vertex_gen_ai = None
-        self.setup_interface()
+   def __init__(self):
+       self.rag_system = None
+       self.temp_dir = tempfile.mkdtemp()
+       self.vertex_gen_ai = None
+       self.setup_interface()
 
-    def setup_interface(self):
-        """Set up the Gradio interface."""
-        with gr.Blocks(theme=gr.themes.Base()) as self.interface:
-            gr.Markdown("# Advanced PDF Chat with Document, Page, Section Citations and Image References")
+   def setup_interface(self):
+       """Set up the Gradio interface."""
+       with gr.Blocks(theme=gr.themes.Base()) as self.interface:
+           gr.Markdown("# Advanced PDF Chat with Document, Page, Section Citations and Image References")
 
-            with gr.Row():
-                with gr.Column(scale=1):
-                    # System Configuration
-                    gr.Markdown("## 🤖 System Configuration")
+           with gr.Row():
+               with gr.Column(scale=1):
+                   # System Configuration
+                   gr.Markdown("## 🤖 System Configuration")
 
-                    # VertexAI Settings
-                    with gr.Group():
-                        initialize_vertex_btn = gr.Button("Initialize VertexAI", variant="primary")
-                        vertex_status = gr.Textbox(label="VertexAI Status", value="Not initialized")
+                   # VertexAI Settings
+                   with gr.Group():
+                       ca_bundle_path = gr.Textbox(
+                           label="CA Bundle Path (optional)",
+                           placeholder="Path to PROD CA pem file",
+                           value=""
+                       )
+                       initialize_vertex_btn = gr.Button("Initialize VertexAI", variant="primary")
+                       vertex_status = gr.Textbox(label="VertexAI Status", value="Not initialized")
 
-                    # Vector DB settings
-                    gr.Markdown("## 💾 Vector Database Settings")
-                    use_existing_db = gr.Checkbox(label="Use Existing FAISS Index", value=False)
+                   # Vector DB settings
+                   gr.Markdown("## 💾 Vector Database Settings")
+                   use_existing_db = gr.Checkbox(label="Use Existing FAISS Index", value=False)
 
-                    with gr.Group(visible=False) as faiss_settings:
-                        faiss_path = gr.Textbox(
-                            label="FAISS Index Path",
-                            placeholder="Path to existing FAISS index"
-                        )
+                   with gr.Group(visible=False) as faiss_settings:
+                       faiss_path = gr.Textbox(
+                           label="FAISS Index Path",
+                           placeholder="Path to existing FAISS index"
+                       )
 
-                    # OCR Settings
-                    gr.Markdown("## 🔍 OCR Settings")
-                    enable_ocr = gr.Checkbox(label="Enable OCR for Images", value=True)
+                   # OCR Settings
+                   gr.Markdown("## 🔍 OCR Settings")
+                   enable_ocr = gr.Checkbox(label="Enable OCR for Images", value=True)
 
-                    initialize_btn = gr.Button("Initialize System")
+                   initialize_btn = gr.Button("Initialize System")
 
-                    # Document upload section
-                    gr.Markdown("## 📄 Upload Documents")
-                    pdf_upload = gr.File(
-                        label="Upload PDF Documents",
-                        file_types=[".pdf"],
-                        file_count="multiple"
-                    )
-                    upload_button = gr.Button("Process PDFs")
-                    save_index_button = gr.Button("Save FAISS Index")
-                    faiss_save_path = gr.Textbox(
-                        label="Save FAISS Index To",
-                        placeholder="Path to save the current FAISS index",
-                        value="/content/faiss_index"
-                    )
-                    doc_status = gr.Markdown("No documents uploaded yet.")
+                   # Document upload section
+                   gr.Markdown("## 📄 Upload Documents")
+                   pdf_upload = gr.File(
+                       label="Upload PDF Documents",
+                       file_types=[".pdf"],
+                       file_count="multiple"
+                   )
+                   upload_button = gr.Button("Process PDFs")
+                   save_index_button = gr.Button("Save FAISS Index")
+                   faiss_save_path = gr.Textbox(
+                       label="Save FAISS Index To",
+                       placeholder="Path to save the current FAISS index",
+                       value="/content/faiss_index"
+                   )
+                   doc_status = gr.Markdown("No documents uploaded yet.")
 
-                    # System controls
-                    gr.Markdown("## ⚙️ System Controls")
-                    reset_btn = gr.Button("Reset Conversation")
+                   # System controls
+                   gr.Markdown("## ⚙️ System Controls")
+                   reset_btn = gr.Button("Reset Conversation")
 
                with gr.Column(scale=2):
                    # Chat interface
@@ -773,7 +844,7 @@ class GradioRAGInterface:
                        label="Your Question",
                        lines=1
                    )
-                   submit_btn = gr.Button("Ask")
+                   submit_btn = gr.Button("Ask", variant="primary")
 
                    # Citation information with enhanced display
                    gr.Markdown("## 📊 Citation Information")
@@ -806,7 +877,7 @@ class GradioRAGInterface:
            # Initialize VertexAI button
            initialize_vertex_btn.click(
                fn=self.initialize_vertex_ai,
-               inputs=[],
+               inputs=[ca_bundle_path],
                outputs=[vertex_status]
            )
 
@@ -866,19 +937,30 @@ class GradioRAGInterface:
                outputs=[chatbot, doc_status, citation_display, image_gallery, image_info]
            )
 
-       # Launch the interface
-       self.interface.launch(share=True, debug=True)
-
-   def initialize_vertex_ai(self):
+   def initialize_vertex_ai(self, ca_bundle_path):
        """Initialize VertexAI instance."""
        try:
+           # Set the CA bundle if provided
+           if ca_bundle_path and os.path.exists(ca_bundle_path):
+               os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle_path
+               logger.info(f"Set CA bundle path to: {ca_bundle_path}")
+               
            self.vertex_gen_ai = VertexGenAI()
-           # Test the connection
-           test_response = self.vertex_gen_ai.generate_content()
-           if test_response:
-               return "✅ VertexAI initialized successfully!"
+           
+           # Test the connection with both generation and embedding
+           test_prompt = "Hello, this is a test."
+           test_response = self.vertex_gen_ai.generate_content(test_prompt)
+           test_embedding = self.vertex_gen_ai.get_embeddings([test_prompt])
+           
+           if test_response and test_embedding:
+               return "✅ VertexAI initialized successfully! Both generation and embeddings are working."
+           elif test_response:
+               return "⚠️ VertexAI generation works but embeddings failed. Check your embedding model access."
+           elif test_embedding:
+               return "⚠️ VertexAI embeddings work but generation failed. Check your generative model access."
            else:
-               return "⚠️ VertexAI initialized but test failed. Check your credentials."
+               return "❌ VertexAI initialized but both generation and embeddings failed. Check your credentials and model access."
+               
        except Exception as e:
            return f"❌ Failed to initialize VertexAI: {str(e)}"
 
@@ -1080,8 +1162,9 @@ def setup_google_auth():
 
 # Export the interface for easy import in Colab
 def launch_rag_interface():
+   """Launch the RAG interface."""
    interface = GradioRAGInterface()
-   return interface
+   return interface.interface
 
 # Main entry point for running in Colab
 if __name__ == "__main__":
@@ -1101,19 +1184,16 @@ if __name__ == "__main__":
        os.makedirs("/content/faiss_index", exist_ok=True)
        print("Created directory for FAISS indices at /content/faiss_index")
 
-       # Set environment variable for CA bundle if needed
-       if "REQUESTS_CA_BUNDLE" in os.environ:
-           print(f"CA Bundle path: {os.environ['REQUESTS_CA_BUNDLE']}")
-
        print("\n== IMPORTANT NOTES ==")
        print("1. Click 'Initialize VertexAI' button first")
-       print("2. Make sure your Google Cloud project has Vertex AI API enabled")
-       print("3. The system will use your project's Vertex AI for embeddings and generation")
-       print("4. Images in PDFs will be extracted and OCR will be performed if enabled")
+       print("2. Optionally provide CA Bundle path if needed")
+       print("3. Make sure your Google Cloud project has Vertex AI API enabled")
+       print("4. The system will use your project's Vertex AI for embeddings and generation")
+       print("5. Images in PDFs will be extracted and OCR will be performed if enabled")
        
    except ImportError:
        print("Not running in Google Colab environment")
 
    # Launch the interface
    interface = launch_rag_interface()
-   print("\nRAG System is running. Close this cell output to shut down the server.")
+   print("\nRAG System is running. Access the interface through the provided URL.")
