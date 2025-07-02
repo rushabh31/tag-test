@@ -1,1199 +1,675 @@
-# -*- coding: utf-8 -*-
-"""Advanced-RAG-with-References-Extended-with-Images.ipynb
-
-This notebook builds on the original Advanced RAG system, adding:
-1. Support for loading/saving FAISS vector databases
-2. Integration with Google Vertex AI as an alternative to Groq
-3. Image extraction and OCR capabilities for PDFs
-4. Display of referenced images in responses
-"""
-
-# Install required packages
-!pip install langchain langchain-groq sentence-transformers faiss-cpu pypdf gradio tiktoken -q
-!pip install -q pypdf langchain langchain_groq faiss-cpu langchain_community sentence-transformers chromadb tiktoken langchain_core
-!pip install -q google-cloud-aiplatform langchain-google-vertexai
-!pip install -q pdf2image pytesseract pillow opencv-python-headless
-!apt-get install -y poppler-utils tesseract-ocr
-
 import os
-import re
-import tempfile
-import numpy as np
-import pandas as pd
-from typing import List, Dict, Tuple, Optional, Any, Set, Union
-from dataclasses import dataclass, field
-import json
-from tqdm.notebook import tqdm
-import time
-import logging
-import base64
-from io import BytesIO
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-import pypdf
-from pdf2image import convert_from_path
-import pytesseract
-from PIL import Image
-import cv2
-
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS, Chroma
-from langchain_groq import ChatGroq
-from langchain_google_vertexai import ChatVertexAI
-from langchain.chains import ConversationalRetrievalChain, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.prompts import PromptTemplate, ChatPromptTemplate
-from langchain.schema import Document
-from langchain_community.embeddings import SentenceTransformerEmbeddings
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
 import gradio as gr
+import fitz  # PyMuPDF
+import pandas as pd
+import numpy as np
+from typing import List, Dict, Any, Tuple
+import json
+import re
+from dataclasses import dataclass
+from sklearn.metrics.pairwise import cosine_similarity
+import logging
+from PIL import Image
+import io
+import base64
+from sentence_transformers import CrossEncoder
+import hashlib
+import tempfile
+import shutil
 
-# Import your VertexGenAI class
-from connection import VertexGenAI
+# Your existing VertexAI code
+import vertexai
+from google.oauth2.credentials import Credentials
+from helpers import get_coin_token
+from vertexai.generative_models import GenerativeModel
 
-@dataclass
-class ImageData:
-    """Store extracted image data."""
-    image: Image.Image
-    page_number: int
-    bbox: Optional[Tuple[int, int, int, int]] = None  # Bounding box coordinates
-    ocr_text: str = ""
-    base64_string: str = ""
-
-@dataclass
-class PageChunk:
-    """Store chunk information with precise page tracking and image references."""
-    text: str
-    page_numbers: List[int]
-    start_char_idx: int
-    end_char_idx: int
-    filename: str
-    section_info: Dict[str, str] = field(default_factory=dict)
-    image_refs: List[int] = field(default_factory=list)  # References to images by index
-
-    def to_document(self) -> Document:
-        """Convert to LangChain Document."""
-        return Document(
-            page_content=self.text,
-            metadata={
-                "page_numbers": self.page_numbers,
-                "source": self.filename,
-                "start_idx": self.start_char_idx,
-                "end_idx": self.end_char_idx,
-                "section_info": self.section_info,
-                "image_refs": self.image_refs
-            }
+class VertexGenAI:
+    def __init__(self):
+        credentials = Credentials(get_coin_token())
+        vertexai.init(
+            project="pri-gen-ai",
+            api_transport="rest",
+            api_endpoint="https://xyz/vertex",
+            credentials=credentials,
         )
+        self.metadata = [("x-user", os.getenv("USERNAME"))]
 
-@dataclass
-class PDFDocument:
-    """Enhanced class to store PDF document metadata, content, and images."""
-    filename: str
-    content: str = ""
-    pages: Dict[int, str] = field(default_factory=dict)
-    char_to_page_map: List[int] = field(default_factory=list)
-    chunks: List[PageChunk] = field(default_factory=list)
-    images: List[ImageData] = field(default_factory=list)
-    image_to_page_map: Dict[int, int] = field(default_factory=dict)  # Image index to page number
+    def generate_content(self, prompt: str = "Provide interesting trivia"):
+        """Generate content based on the provided prompt."""
+        model = GenerativeModel("gemini-1.5-pro-002")
+        resp = model.generate_content(prompt, metadata=self.metadata)
+        return resp.text if resp else None
 
-    def __len__(self) -> int:
-        return len(self.content)
-
-    @property
-    def langchain_documents(self) -> List[Document]:
-        """Convert chunks to LangChain Documents."""
-        return [chunk.to_document() for chunk in self.chunks]
-
-class EnhancedPDFProcessor:
-    """Advanced PDF processor with image extraction and OCR capabilities."""
-
-    def __init__(self,
-                 chunk_size: int = 1000,
-                 chunk_overlap: int = 200,
-                 separator: str = "\n\n",
-                 keep_separator: bool = False,
-                 enable_ocr: bool = True):
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.separator = separator
-        self.keep_separator = keep_separator
-        self.enable_ocr = enable_ocr
-
-        # Create a text splitter with careful configuration
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", " ", ""],
-            keep_separator=keep_separator
-        )
-
-        # Regex patterns for section detection
-        self.section_patterns = [
-            r'(?:Section|SECTION|Chapter|CHAPTER)\s+(\d+(?:\.\d+)*)[:\s]+(.*?)(?=\n|$)',
-            r'(\d+(?:\.\d+)*)\s+(.*?)(?=\n|$)',
-            r'(?:\n|\A)([A-Z][A-Z\s]+)(?:\n|:)'
-        ]
-
-    def extract_images_from_pdf(self, file_path: str) -> List[ImageData]:
-        """Extract images from PDF and perform OCR if enabled."""
-        images = []
+    def get_embeddings(self, texts: list[str], model_name: str = "text-embedding-004"):
+        from vertexai.language_models import TextEmbeddingModel
         
-        try:
-            # Convert PDF pages to images
-            pdf_images = convert_from_path(file_path, dpi=300)
-            
-            for page_num, page_image in enumerate(pdf_images, 1):
-                # Convert PIL Image to OpenCV format for processing
-                opencv_image = cv2.cvtColor(np.array(page_image), cv2.COLOR_RGB2BGR)
-                
-                # Detect regions with significant content (potential embedded images/figures)
-                gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-                
-                # Apply edge detection to find image boundaries
-                edges = cv2.Canny(gray, 50, 150)
-                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                # Filter contours by area to find significant image regions
-                min_area = 10000  # Adjust based on your needs
-                for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area > min_area:
-                        x, y, w, h = cv2.boundingRect(contour)
-                        
-                        # Extract the region
-                        roi = page_image.crop((x, y, x + w, y + h))
-                        
-                        # Perform OCR if enabled
-                        ocr_text = ""
-                        if self.enable_ocr:
-                            try:
-                                ocr_text = pytesseract.image_to_string(roi)
-                            except Exception as e:
-                                logger.warning(f"OCR failed for image on page {page_num}: {str(e)}")
-                        
-                        # Convert to base64 for display
-                        buffered = BytesIO()
-                        roi.save(buffered, format="PNG")
-                        img_base64 = base64.b64encode(buffered.getvalue()).decode()
-                        
-                        image_data = ImageData(
-                            image=roi,
-                            page_number=page_num,
-                            bbox=(x, y, x + w, y + h),
-                            ocr_text=ocr_text,
-                            base64_string=img_base64
-                        )
-                        images.append(image_data)
-                
-                # Also store the full page as an image for reference
-                buffered = BytesIO()
-                page_image.save(buffered, format="PNG")
-                full_page_base64 = base64.b64encode(buffered.getvalue()).decode()
-                
-                # Perform OCR on full page if no specific regions were found
-                if not any(img.page_number == page_num for img in images):
-                    ocr_text = ""
-                    if self.enable_ocr:
-                        try:
-                            ocr_text = pytesseract.image_to_string(page_image)
-                        except Exception as e:
-                            logger.warning(f"OCR failed for page {page_num}: {str(e)}")
-                    
-                    full_page_data = ImageData(
-                        image=page_image,
-                        page_number=page_num,
-                        ocr_text=ocr_text,
-                        base64_string=full_page_base64
-                    )
-                    images.append(full_page_data)
-                    
-        except Exception as e:
-            logger.error(f"Error extracting images from PDF: {str(e)}")
-            
-        return images
-
-    def extract_text_from_pdf(self, file_path: str) -> PDFDocument:
-        """Extract text from PDF with enhanced page-level tracking and image extraction."""
-        doc = PDFDocument(filename=os.path.basename(file_path))
-        full_text = ""
-        char_to_page = []
-
-        try:
-            # Extract images first
-            doc.images = self.extract_images_from_pdf(file_path)
-            
-            # Create image to page mapping
-            for idx, img in enumerate(doc.images):
-                doc.image_to_page_map[idx] = img.page_number
-            
-            with open(file_path, "rb") as file:
-                pdf = pypdf.PdfReader(file)
-
-                if len(pdf.pages) == 0:
-                    logger.warning(f"PDF {file_path} has no pages.")
-                    doc.content = ""
-                    doc.char_to_page_map = []
-                    return doc
-
-                for i, page in enumerate(pdf.pages):
-                    page_num = i + 1
-                    page_text = page.extract_text() or ""
-
-                    # Clean the text
-                    page_text = self._clean_pdf_text(page_text)
-                    
-                    # Add OCR text from images on this page
-                    ocr_texts = [img.ocr_text for img in doc.images if img.page_number == page_num]
-                    if ocr_texts:
-                        page_text += "\n\n[OCR Extracted Text]:\n" + "\n".join(ocr_texts)
-
-                    if page_text.strip():
-                        doc.pages[page_num] = page_text
-                        full_text += page_text
-                        char_to_page.extend([page_num] * len(page_text))
-
-            doc.content = full_text
-            doc.char_to_page_map = char_to_page
-            return doc
-
-        except Exception as e:
-            logger.error(f"Error extracting text from PDF {file_path}: {str(e)}")
-            raise
-
-    def _clean_pdf_text(self, text: str) -> str:
-        """Clean extracted PDF text to improve quality."""
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'\s*\n\s*', '\n', text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = re.sub(r'([a-z])- ?([a-z])', r'\1\2', text)
-        return text
-
-    def _extract_section_info(self, text: str) -> Dict[str, str]:
-        """Extract section headings and numbers from text."""
-        section_info = {}
-
-        for pattern in self.section_patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                if len(match.groups()) >= 2:
-                    section_number = match.group(1)
-                    section_title = match.group(2).strip()
-                    section_info[section_number] = section_title
-                elif len(match.groups()) == 1:
-                    section_title = match.group(1).strip()
-                    section_info[f"heading_{len(section_info)}"] = section_title
-
-        return section_info
-
-    def chunk_document(self, doc: PDFDocument) -> PDFDocument:
-        """Chunk document with page tracking and image references."""
-        if not doc.content or not doc.char_to_page_map:
-            if not doc.content:
-                logger.warning(f"Document {doc.filename} has no content to chunk.")
-            if not doc.char_to_page_map:
-                logger.warning(f"Document {doc.filename} has no page mapping available.")
-            return doc
-
-        try:
-            raw_chunks = self.text_splitter.create_documents([doc.content])
-        except Exception as e:
-            logger.error(f"Error creating chunks: {str(e)}")
-            return doc
-
-        for i, chunk in enumerate(raw_chunks):
-            chunk_text = chunk.page_content
-
-            # Find position in the original text
-            start_pos = doc.content.find(chunk_text)
-            if start_pos == -1:
-                logger.warning(f"Could not find exact chunk position for chunk {i}.")
-                start_pos = 0
-                end_pos = min(len(chunk_text), len(doc.content)) - 1
-            else:
-                end_pos = start_pos + len(chunk_text) - 1
-
-            # Find the page numbers this chunk spans
-            chunk_pages = set()
-            for pos in range(start_pos, min(end_pos + 1, len(doc.char_to_page_map))):
-                if pos < len(doc.char_to_page_map):
-                    chunk_pages.add(doc.char_to_page_map[pos])
-
-            if not chunk_pages:
-                chunk_pages = {1}
-                logger.warning(f"No pages found for chunk {i} in document {doc.filename}.")
-
-            # Find related images
-            image_refs = []
-            for idx, img in enumerate(doc.images):
-                if img.page_number in chunk_pages:
-                    # Check if the image's OCR text is mentioned in the chunk
-                    if img.ocr_text and any(text_part in chunk_text for text_part in img.ocr_text.split()[:5]):
-                        image_refs.append(idx)
-                    # Or if chunk mentions "figure", "image", "diagram" near this page
-                    elif any(keyword in chunk_text.lower() for keyword in ["figure", "image", "diagram", "chart", "graph"]):
-                        image_refs.append(idx)
-
-            # Extract section information
-            section_info = self._extract_section_info(chunk_text)
-
-            # Create PageChunk
-            page_chunk = PageChunk(
-                text=chunk_text,
-                page_numbers=sorted(list(chunk_pages)),
-                start_char_idx=start_pos,
-                end_char_idx=end_pos,
-                filename=doc.filename,
-                section_info=section_info,
-                image_refs=image_refs
-            )
-
-            doc.chunks.append(page_chunk)
-
-        return doc
-
-    def process_pdf(self, file_path: str) -> PDFDocument:
-        """Process PDF file in a single call."""
-        doc = self.extract_text_from_pdf(file_path)
-        return self.chunk_document(doc)
-
-class VertexAIEmbeddings:
-    """Custom embeddings class using VertexGenAI."""
-    
-    def __init__(self, vertex_gen_ai: VertexGenAI, model_name: str = "text-embedding-004"):
-        self.vertex_gen_ai = vertex_gen_ai
-        self.model_name = model_name
-        self._embedding_dimension = None
-    
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Embed multiple documents."""
+        model = TextEmbeddingModel.from_pretrained(model_name, metadata=self.metadata)
+        
         if not texts:
             return []
-            
-        try:
-            # Get embeddings from VertexGenAI
-            embeddings_response = self.vertex_gen_ai.get_embeddings(texts, self.model_name)
-            
-            # Extract vectors from response
-            embeddings = []
-            for embedding in embeddings_response:
-                if hasattr(embedding, 'values'):
-                    embeddings.append(list(embedding.values))
-                else:
-                    # Log warning and use zero vector as fallback
-                    logger.warning(f"Embedding response missing 'values' attribute")
-                    embeddings.append(self._get_zero_vector())
-            
-            # Set embedding dimension if not already set
-            if embeddings and self._embedding_dimension is None:
-                self._embedding_dimension = len(embeddings[0])
-                
-            return embeddings
-            
-        except Exception as e:
-            logger.error(f"Error getting embeddings: {str(e)}")
-            # Return zero vectors for all texts
-            return [self._get_zero_vector() for _ in texts]
-    
-    def embed_query(self, text: str) -> List[float]:
-        """Embed a single query."""
-        if not text:
-            return self._get_zero_vector()
-            
-        try:
-            # Get embedding for single text
-            embeddings_response = self.vertex_gen_ai.get_embeddings([text], self.model_name)
-            
-            if embeddings_response and len(embeddings_response) > 0:
-                embedding = embeddings_response[0]
-                if hasattr(embedding, 'values'):
-                    vector = list(embedding.values)
-                    # Update dimension if needed
-                    if self._embedding_dimension is None:
-                        self._embedding_dimension = len(vector)
-                    return vector
-                    
-            return self._get_zero_vector()
-            
-        except Exception as e:
-            logger.error(f"Error getting query embedding: {str(e)}")
-            return self._get_zero_vector()
-    
-    def _get_zero_vector(self) -> List[float]:
-        """Get a zero vector of appropriate dimension."""
-        # Use stored dimension or default to 768 (common embedding size)
-        dim = self._embedding_dimension if self._embedding_dimension else 768
-        return [0.0] * dim
-
-    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Async version - just calls sync version for now."""
-        return self.embed_documents(texts)
-    
-    async def aembed_query(self, text: str) -> List[float]:
-        """Async version - just calls sync version for now."""
-        return self.embed_query(text)
-
-class HybridRetriever:
-    """Hybrid retrieval system with VertexAI embeddings."""
-
-    def __init__(self, documents: List[Document] = None, use_mmr: bool = True,
-                 faiss_index_path: str = None, vertex_gen_ai: VertexGenAI = None):
-        """Initialize retriever with documents or existing FAISS index."""
         
-        if vertex_gen_ai:
-            self.embeddings = VertexAIEmbeddings(vertex_gen_ai)
-        else:
-            # Fallback to sentence transformers if VertexGenAI not provided
-            self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+        if isinstance(texts, str):
+            texts = [texts]
+            
+        embeddings = model.get_embeddings(texts, metadata=self.metadata)
+        return embeddings
 
-        if faiss_index_path and os.path.exists(faiss_index_path):
-            self.vector_store = FAISS.load_local(faiss_index_path, self.embeddings)
-            logger.info(f"Loaded existing FAISS index from {faiss_index_path}")
-        elif documents:
-            self.vector_store = FAISS.from_documents(documents, self.embeddings)
-            logger.info("Created new FAISS index from documents")
-        else:
-            self.vector_store = FAISS.from_texts(["placeholder"], self.embeddings)
-            logger.info("Created empty FAISS index")
+@dataclass
+class DocumentChunk:
+    text: str
+    page_number: int
+    section: str
+    subsection: str
+    chunk_id: str
+    source_type: str  # 'text' or 'image'
+    image_description: str = ""
+    bbox: tuple = None  # bounding box for images
+    embedding: List[float] = None
+    image_path: str = None  # Path to saved image file
+    image_data: bytes = None  # Raw image data
 
-        self.retriever = self.vector_store.as_retriever(
-            search_type="mmr" if use_mmr else "similarity",
-            search_kwargs={"k": 6, "fetch_k": 10} if use_mmr else {"k": 5}
-        )
-
-    def get_relevant_documents(self, query: str, top_k: int = 5) -> List[Document]:
-        """Get relevant documents using hybrid search."""
-        return self.retriever.get_relevant_documents(query)
-
-    def update_documents(self, documents: List[Document]):
-        """Update the document store with new documents."""
-        self.vector_store.add_documents(documents)
-
-    def save_index(self, path: str):
-        """Save the FAISS index to disk."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self.vector_store.save_local(path)
-        return f"Saved FAISS index to {path}"
+class AdvancedPDFProcessor:
+    def __init__(self, vertex_ai: VertexGenAI):
+        self.vertex_ai = vertex_ai
+        self.chunks = []
+        self.chunk_embeddings = []
+        self.temp_dir = tempfile.mkdtemp()  # Directory for storing extracted images
+        
+    def extract_images_and_text(self, pdf_path: str) -> List[DocumentChunk]:
+        """Extract text and images from PDF with detailed metadata"""
+        doc = fitz.open(pdf_path)
+        chunks = []
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            
+            # Extract text with structure
+            text_chunks = self._extract_structured_text(page, page_num + 1)
+            chunks.extend(text_chunks)
+            
+            # Extract images
+            image_chunks = self._extract_images_with_ocr(page, page_num + 1, pdf_path)
+            chunks.extend(image_chunks)
+        
+        doc.close()
+        return chunks
+    
+    def _extract_structured_text(self, page, page_num: int) -> List[DocumentChunk]:
+        """Extract text with hierarchical structure detection"""
+        blocks = page.get_text("dict")
+        chunks = []
+        current_section = "Unknown Section"
+        current_subsection = "Unknown Subsection"
+        
+        for block in blocks["blocks"]:
+            if "lines" not in block:
+                continue
+                
+            block_text = ""
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    text = span["text"].strip()
+                    if text:
+                        # Detect headers based on font size and style
+                        font_size = span["size"]
+                        font_flags = span["flags"]
+                        
+                        if font_size > 14 or font_flags & 2**4:  # Large or bold text
+                            if self._is_section_header(text):
+                                current_section = text
+                                current_subsection = "Unknown Subsection"
+                            elif self._is_subsection_header(text):
+                                current_subsection = text
+                        
+                        block_text += text + " "
+            
+            if block_text.strip():
+                # Apply semantic chunking
+                semantic_chunks = self._semantic_chunking(block_text.strip())
+                
+                for chunk_text in semantic_chunks:
+                    chunk_id = self._generate_chunk_id(chunk_text, page_num)
+                    chunk = DocumentChunk(
+                        text=chunk_text,
+                        page_number=page_num,
+                        section=current_section,
+                        subsection=current_subsection,
+                        chunk_id=chunk_id,
+                        source_type="text"
+                    )
+                    chunks.append(chunk)
+        
+        return chunks
+    
+    def _extract_images_with_ocr(self, page, page_num: int, pdf_path: str) -> List[DocumentChunk]:
+        """Extract images and perform OCR - Enhanced to save actual images"""
+        chunks = []
+        image_list = page.get_images()
+        
+        for img_index, img in enumerate(image_list):
+            try:
+                # Get image
+                xref = img[0]
+                pix = fitz.Pixmap(page.parent, xref)
+                
+                if pix.n - pix.alpha < 4:  # GRAY or RGB
+                    img_data = pix.tobytes("png")
+                    
+                    # Save image to temporary file
+                    img_filename = f"page_{page_num}_img_{img_index}.png"
+                    img_path = os.path.join(self.temp_dir, img_filename)
+                    
+                    with open(img_path, "wb") as f:
+                        f.write(img_data)
+                    
+                    # Convert to PIL Image for processing
+                    pil_image = Image.open(io.BytesIO(img_data))
+                    
+                    # Get image description using Vision API
+                    img_description = self._get_image_description(pil_image)
+                    
+                    # Get bounding box
+                    bbox = page.get_image_bbox(img)
+                    
+                    chunk_id = f"img_{page_num}_{img_index}"
+                    chunk = DocumentChunk(
+                        text=img_description,
+                        page_number=page_num,
+                        section="Image Content",
+                        subsection=f"Image {img_index + 1}",
+                        chunk_id=chunk_id,
+                        source_type="image",
+                        image_description=img_description,
+                        bbox=bbox,
+                        image_path=img_path,
+                        image_data=img_data
+                    )
+                    chunks.append(chunk)
+                
+                pix = None
+            except Exception as e:
+                logging.error(f"Error processing image {img_index} on page {page_num}: {e}")
+                continue
+        
+        return chunks
+    
+    def _get_image_description(self, image: Image.Image) -> str:
+        """Get image description using Vertex AI Vision"""
+        try:
+            # Convert PIL image to base64
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+            
+            prompt = """Analyze this image and provide a detailed description including:
+            1. Main objects, text, charts, or diagrams visible
+            2. Any readable text content
+            3. Context and purpose of the image
+            4. Key information that might be relevant for document search
+            
+            Be comprehensive but concise."""
+            
+            # Enhanced prompt with image analysis
+            full_prompt = f"{prompt}\n\nImage Analysis: Describe what you see in this image in detail."
+            description = self.vertex_ai.generate_content(full_prompt)
+            return description or "Image content could not be analyzed"
+            
+        except Exception as e:
+            logging.error(f"Error getting image description: {e}")
+            return "Image content analysis failed"
+    
+    def _semantic_chunking(self, text: str, max_chunk_size: int = 500) -> List[str]:
+        """Advanced semantic chunking with sentence boundary preservation"""
+        sentences = self._split_into_sentences(text)
+        chunks = []
+        current_chunk = ""
+        
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) <= max_chunk_size:
+                current_chunk += sentence + " "
+            else:
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + " "
+        
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences with improved accuracy"""
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        return [s.strip() for s in sentences if s.strip()]
+    
+    def _is_section_header(self, text: str) -> bool:
+        """Detect if text is a section header"""
+        patterns = [
+            r'^\d+\.\s+[A-Z]',  # 1. Introduction
+            r'^[A-Z][A-Z\s]{2,}$',  # ALL CAPS
+            r'^Chapter\s+\d+',  # Chapter 1
+            r'^Section\s+\d+',  # Section 1
+        ]
+        return any(re.match(pattern, text) for pattern in patterns)
+    
+    def _is_subsection_header(self, text: str) -> bool:
+        """Detect if text is a subsection header"""
+        patterns = [
+            r'^\d+\.\d+\s+[A-Z]',  # 1.1 Subsection
+            r'^[A-Z][a-z]+\s+[A-Z][a-z]+',  # Title Case
+        ]
+        return any(re.match(pattern, text) for pattern in patterns)
+    
+    def _generate_chunk_id(self, text: str, page_num: int) -> str:
+        """Generate unique chunk ID"""
+        text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+        return f"chunk_{page_num}_{text_hash}"
 
 class AdvancedRAGSystem:
-    """Enhanced RAG system with VertexAI integration and image support."""
-
-    def __init__(self,
-                 vertex_gen_ai: VertexGenAI = None,
-                 faiss_index_path: str = None,
-                 enable_ocr: bool = True):
-
-        self.vertex_gen_ai = vertex_gen_ai
-        self.enable_ocr = enable_ocr
-
-        self.processor = EnhancedPDFProcessor(
-            chunk_size=800,
-            chunk_overlap=200,
-            enable_ocr=enable_ocr
-        )
-        self.documents = {}  # Store processed documents
-        self.retrievers = {}  # Store retrievers by document
-
-        # Initialize hybrid retriever
-        self.hybrid_retriever = None
-        self.faiss_index_path = faiss_index_path
-
-        # If we have a FAISS path, initialize the retriever
-        if faiss_index_path and os.path.exists(faiss_index_path):
-            self.hybrid_retriever = HybridRetriever(
-                faiss_index_path=faiss_index_path,
-                vertex_gen_ai=vertex_gen_ai
-            )
-
-        self.conversation_history = []
-        self.conversation_chain = None
-
-        # Initialize conversation chain if we have VertexGenAI
-        if vertex_gen_ai:
-            self._initialize_conversation_chain()
-
-    def upload_pdf(self, file_path: str) -> str:
-        """Process and index a PDF document with image extraction."""
+    def __init__(self, vertex_ai: VertexGenAI):
+        self.vertex_ai = vertex_ai
+        self.pdf_processor = AdvancedPDFProcessor(vertex_ai)
+        self.chunks = []
+        self.embeddings_matrix = None
         try:
-            # Process the document
-            doc = self.processor.process_pdf(file_path)
-
-            # Store the document
-            self.documents[doc.filename] = doc
-
-            # Update the retrievers
-            self._update_retrievers()
-
-            image_count = len(doc.images)
-            return f"Processed and indexed {doc.filename} ({len(doc.pages)} pages, {len(doc.chunks)} chunks, {image_count} images extracted)"
+            self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-2-v2')
         except Exception as e:
-            logger.error(f"Error uploading PDF: {str(e)}")
-            raise
-
-    def _update_retrievers(self):
-        """Update the retriever system with current documents."""
-        all_docs = []
-        for doc in self.documents.values():
-            all_docs.extend(doc.langchain_documents)
-
-        if not all_docs:
-            return
-
-        if not self.hybrid_retriever:
-            self.hybrid_retriever = HybridRetriever(
-                all_docs,
-                vertex_gen_ai=self.vertex_gen_ai
-            )
-        else:
-            self.hybrid_retriever.update_documents(all_docs)
-
-        self._initialize_conversation_chain()
-
-    def _create_custom_chain(self, retriever):
-        """Create a custom chain that handles our specific prompt format."""
+            logging.warning(f"Could not load cross-encoder: {e}")
+            self.cross_encoder = None
         
-        def format_docs(docs):
-            formatted = []
-            for doc in docs:
-                content = doc.page_content
-                metadata = doc.metadata
-                
-                # Include image references if available
-                image_note = ""
-                if metadata.get('image_refs'):
-                    image_note = f"\nImage References: {metadata['image_refs']}"
-                    
-                formatted_doc = f"""
-Document: {metadata.get('source', 'Unknown')}
-Pages: {metadata.get('page_numbers', [])}
-Section: {metadata.get('section_info', {})}
-Content: {content}{image_note}
-"""
-                formatted.append(formatted_doc)
-            return "\n\n---\n\n".join(formatted)
+    def process_pdfs(self, pdf_files: List[str]) -> str:
+        """Process multiple PDF files"""
+        all_chunks = []
         
-        def custom_chain(inputs):
+        for pdf_file in pdf_files:
             try:
-                # Get relevant documents
-                docs = retriever.get_relevant_documents(inputs["question"])
-                
-                # Format context
-                context = format_docs(docs)
-                
-                # Format chat history
-                chat_history = ""
-                for q, a in self.conversation_history[-5:]:  # Last 5 exchanges
-                    chat_history += f"Human: {q}\nAssistant: {a}\n\n"
-                
-                # Create prompt
-                prompt = f"""You are a precise document assistant with perfect knowledge of the provided document information.
-Your goal is to give accurate, thorough answers with exact document and page citations.
+                chunks = self.pdf_processor.extract_images_and_text(pdf_file)
+                all_chunks.extend(chunks)
+            except Exception as e:
+                logging.error(f"Error processing {pdf_file}: {e}")
+                continue
+        
+        if not all_chunks:
+            return "No content could be extracted from the uploaded PDFs."
+        
+        # Generate embeddings for all chunks
+        texts = [chunk.text for chunk in all_chunks]
+        try:
+            embeddings = self.vertex_ai.get_embeddings(texts)
+            
+            # Store embeddings in chunks
+            for i, chunk in enumerate(all_chunks):
+                if i < len(embeddings):
+                    chunk.embedding = embeddings[i].values
+        except Exception as e:
+            logging.error(f"Error generating embeddings: {e}")
+            return f"Error generating embeddings: {str(e)}"
+        
+        self.chunks = all_chunks
+        valid_embeddings = [chunk.embedding for chunk in all_chunks if chunk.embedding is not None]
+        
+        if valid_embeddings:
+            self.embeddings_matrix = np.array(valid_embeddings)
+        else:
+            return "No valid embeddings could be generated."
+        
+        return f"Successfully processed {len(pdf_files)} PDFs with {len(all_chunks)} chunks extracted."
+    
+    def hybrid_retrieval(self, query: str, top_k: int = 10) -> List[Tuple[DocumentChunk, float]]:
+        """Hybrid retrieval combining semantic search and keyword matching"""
+        if not self.chunks or self.embeddings_matrix is None:
+            return []
+        
+        try:
+            # Get query embedding
+            query_embedding = self.vertex_ai.get_embeddings([query])[0].values
+            query_embedding = np.array(query_embedding).reshape(1, -1)
+            
+            # Semantic similarity
+            semantic_scores = cosine_similarity(query_embedding, self.embeddings_matrix)[0]
+            
+            # Keyword matching score
+            keyword_scores = self._compute_keyword_scores(query)
+            
+            # Combine scores (weighted)
+            combined_scores = 0.7 * semantic_scores + 0.3 * keyword_scores
+            
+            # Get top candidates
+            top_indices = np.argsort(combined_scores)[::-1][:top_k * 2]  # Get more for reranking
+            
+            candidates = [(self.chunks[idx], combined_scores[idx]) for idx in top_indices if idx < len(self.chunks)]
+            
+            # Rerank using cross-encoder if available
+            if self.cross_encoder:
+                reranked_candidates = self._rerank_with_cross_encoder(query, candidates)
+            else:
+                reranked_candidates = candidates
+            
+            return reranked_candidates[:top_k]
+        
+        except Exception as e:
+            logging.error(f"Error in hybrid retrieval: {e}")
+            return []
+    
+    def _compute_keyword_scores(self, query: str) -> np.ndarray:
+        """Compute keyword-based scores for all chunks"""
+        query_words = set(query.lower().split())
+        scores = []
+        
+        for chunk in self.chunks:
+            chunk_words = set(chunk.text.lower().split())
+            # Jaccard similarity
+            intersection = len(query_words.intersection(chunk_words))
+            union = len(query_words.union(chunk_words))
+            score = intersection / union if union > 0 else 0
+            scores.append(score)
+        
+        return np.array(scores)
+    
+    def _rerank_with_cross_encoder(self, query: str, candidates: List[Tuple[DocumentChunk, float]]) -> List[Tuple[DocumentChunk, float]]:
+        """Rerank candidates using cross-encoder"""
+        if not candidates or not self.cross_encoder:
+            return candidates
+        
+        try:
+            # Prepare pairs for cross-encoder
+            pairs = [(query, chunk.text) for chunk, _ in candidates]
+            
+            # Get scores from cross-encoder
+            ce_scores = self.cross_encoder.predict(pairs)
+            
+            # Combine with original scores
+            reranked = []
+            for i, (chunk, original_score) in enumerate(candidates):
+                combined_score = 0.6 * ce_scores[i] + 0.4 * original_score
+                reranked.append((chunk, combined_score))
+            
+            # Sort by combined score
+            reranked.sort(key=lambda x: x[1], reverse=True)
+            return reranked
+            
+        except Exception as e:
+            logging.error(f"Error in cross-encoder reranking: {e}")
+            return candidates
+    
+    def generate_response_with_images(self, query: str, retrieved_chunks: List[Tuple[DocumentChunk, float]]) -> Tuple[str, List[Dict], List[str]]:
+        """Generate response with detailed references AND image files"""
+        if not retrieved_chunks:
+            return "I couldn't find relevant information to answer your question.", [], []
+        
+        # Prepare context
+        context_parts = []
+        references = []
+        image_paths = []
+        
+        for i, (chunk, score) in enumerate(retrieved_chunks[:5]):  # Top 5 chunks
+            context_parts.append(f"[Context {i+1}]: {chunk.text}")
+            
+            ref = {
+                "chunk_id": chunk.chunk_id,
+                "page": chunk.page_number,
+                "section": chunk.section,
+                "subsection": chunk.subsection,
+                "source_type": chunk.source_type,
+                "relevance_score": float(score),
+                "text_preview": chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text
+            }
+            
+            if chunk.source_type == "image":
+                ref["image_description"] = chunk.image_description
+                ref["bbox"] = chunk.bbox
+                ref["image_path"] = chunk.image_path
+                # Add image path to the list for display
+                if chunk.image_path and os.path.exists(chunk.image_path):
+                    image_paths.append(chunk.image_path)
+            
+            references.append(ref)
+        
+        context = "\n\n".join(context_parts)
+        
+        prompt = f"""You are a helpful assistant that answers questions based on the provided document context. 
 
-IMPORTANT RULES:
-1. Use ONLY the information from the retrieved context below to answer the question
-2. Do NOT use any prior knowledge or information not present in the context
-3. If the answer cannot be found in the context, clearly state: "I cannot find information about this in the provided documents."
-4. Provide exact citations for every piece of information
-
-Retrieved Context:
+Context from documents:
 {context}
 
-{f"Previous Conversation:{chr(10)}{chat_history}" if chat_history else ""}
+Question: {query}
 
-User Question: {inputs["question"]}
+Instructions:
+1. Answer the question based ONLY on the provided context
+2. If the context doesn't contain enough information, say so clearly
+3. Be specific and detailed in your response
+4. Reference specific sections or pages when relevant
+5. If information comes from an image, mention that explicitly
+6. Do not hallucinate or add information not present in the context
 
-Citation Format Requirements:
-1. Begin EACH piece of information with: [Document: "filename.pdf", Page X-Y]
-2. Include section if available: [Document: "filename.pdf", Page X, Section Y: "Title"]
-3. For OCR-extracted content: [Document: "filename.pdf", Page X, Image/Figure]
-4. Be extremely specific about page numbers
-5. Never make up or guess page numbers
-
-Answer the question using ONLY the provided context:"""
-                
-                # Generate response using VertexGenAI
-                response_text = self.vertex_gen_ai.generate_content(prompt)
-                
-                if not response_text:
-                    response_text = "I apologize, but I couldn't generate a response. Please try rephrasing your question."
-                
-                return {
-                    "answer": response_text,
-                    "source_documents": docs
-                }
-                
-            except Exception as e:
-                logger.error(f"Error in custom chain: {str(e)}")
-                return {
-                    "answer": f"An error occurred while processing your question: {str(e)}",
-                    "source_documents": []
-                }
+Answer:"""
         
-        return custom_chain
-
-    def _initialize_conversation_chain(self):
-        """Initialize the conversation chain with VertexGenAI."""
-        if not self.hybrid_retriever or not self.vertex_gen_ai:
-            logger.warning("Missing retriever or VertexGenAI instance")
-            return
-
-        # Create a custom chain since VertexGenAI has a different interface
-        self.conversation_chain = self._create_custom_chain(self.hybrid_retriever.retriever)
-
-    def ask(self, query: str) -> Dict[str, Any]:
-        """Process a query and return answer with citations and relevant images."""
-        if not self.hybrid_retriever or not self.conversation_chain:
-            return {"answer": "Please upload at least one document first."}
-
         try:
-            # Execute the chain
-            result = self.conversation_chain({"question": query})
+            response = self.vertex_ai.generate_content(prompt)
+            return response, references, image_paths
+        except Exception as e:
+            logging.error(f"Error generating response: {e}")
+            return "I encountered an error while generating the response.", references, image_paths
 
-            # Extract answer
-            answer = result.get("answer", "No answer generated")
-            source_docs = result.get("source_documents", [])
-
-            # Find relevant images from source documents
-            relevant_images = []
-            for doc in source_docs:
-                metadata = doc.metadata
-                doc_filename = metadata.get("source", "")
-                image_refs = metadata.get("image_refs", [])
+class ChatbotUI:
+    def __init__(self):
+        try:
+            os.environ["REQUESTS_CA_BUNDLE"] = "<Path to PROD CA pem file>"
+            self.vertex_ai = VertexGenAI()
+            self.rag_system = AdvancedRAGSystem(self.vertex_ai)
+            self.chat_history = []
+        except Exception as e:
+            logging.error(f"Error initializing ChatbotUI: {e}")
+            raise
+        
+    def upload_pdfs(self, files):
+        if not files:
+            return "No files uploaded.", "", []
+        
+        try:
+            file_paths = [file.name for file in files]
+            result = self.rag_system.process_pdfs(file_paths)
+            return result, "", []
+        except Exception as e:
+            error_msg = f"Error processing files: {str(e)}"
+            logging.error(error_msg)
+            return error_msg, "", []
+    
+    def chat(self, message, history):
+        if not message.strip():
+            return history, "", []
+        
+        # Add user message to history
+        history = history or []
+        history.append([message, None])
+        
+        try:
+            # Retrieve relevant chunks
+            retrieved_chunks = self.rag_system.hybrid_retrieval(message)
+            
+            if not retrieved_chunks:
+                response = "I don't have any relevant information to answer your question. Please make sure you've uploaded PDFs first."
+                references = []
+                image_paths = []
+            else:
+                # Generate response with images
+                response, references, image_paths = self.rag_system.generate_response_with_images(message, retrieved_chunks)
+            
+            # Add bot response to history
+            history[-1][1] = response
+            
+            # Format references
+            ref_text = self._format_references(references)
+            
+            return history, ref_text, image_paths
+            
+        except Exception as e:
+            error_msg = f"Error processing your question: {str(e)}"
+            logging.error(error_msg)
+            history[-1][1] = error_msg
+            return history, "", []
+    
+    def _format_references(self, references: List[Dict]) -> str:
+        if not references:
+            return "No references found."
+        
+        ref_text = "## References\n\n"
+        for i, ref in enumerate(references, 1):
+            ref_text += f"**Reference {i}:**\n"
+            ref_text += f"- Page: {ref['page']}\n"
+            ref_text += f"- Section: {ref['section']}\n"
+            ref_text += f"- Subsection: {ref['subsection']}\n"
+            ref_text += f"- Source Type: {ref['source_type']}\n"
+            ref_text += f"- Relevance Score: {ref['relevance_score']:.3f}\n"
+            
+            if ref['source_type'] == 'image':
+                ref_text += f"- Image Description: {ref.get('image_description', 'N/A')}\n"
+                ref_text += f"- **Image displayed in gallery below**\n"
+            
+            ref_text += f"- Preview: {ref['text_preview']}\n\n"
+        
+        return ref_text
+    
+    def clear_chat(self):
+        """Clear chat history and references"""
+        return [], "References will appear here after asking questions.", []
+    
+    def create_interface(self):
+        with gr.Blocks(title="Advanced RAG PDF Chatbot", theme=gr.themes.Soft()) as demo:
+            gr.Markdown("# 📚 Advanced RAG PDF Chatbot with Image References")
+            gr.Markdown("Upload PDFs and ask questions about their content. The system handles text and images with precise referencing, showing actual images when they contain relevant information.")
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    # File upload section
+                    with gr.Group():
+                        gr.Markdown("### 📄 Upload Documents")
+                        file_upload = gr.File(
+                            label="Upload PDF Files",
+                            file_count="multiple",
+                            file_types=[".pdf"],
+                            height=120
+                        )
+                        
+                        upload_btn = gr.Button("Process PDFs", variant="primary", size="lg")
+                        upload_status = gr.Textbox(
+                            label="Processing Status", 
+                            interactive=False,
+                            placeholder="Upload status will appear here..."
+                        )
+                    
+                    # Chat interface
+                    with gr.Group():
+                        gr.Markdown("### 💬 Chat")
+                        chatbot = gr.Chatbot(
+                            label="Conversation",
+                            height=450,
+                            avatar_images=("👤", "🤖"),
+                            bubble_full_width=False,
+                            show_copy_button=True
+                        )
+                        
+                        msg = gr.Textbox(
+                            label="Ask a question about your documents",
+                            placeholder="Type your question here...",
+                            lines=2,
+                            max_lines=5
+                        )
+                        
+                        with gr.Row():
+                            submit_btn = gr.Button("Send", variant="primary", scale=2)
+                            clear_btn = gr.Button("Clear Chat", variant="secondary", scale=1)
                 
-                # Get the document
-                if doc_filename in self.documents:
-                    pdf_doc = self.documents[doc_filename]
-                    for img_idx in image_refs:
-                        if img_idx < len(pdf_doc.images):
-                            img_data = pdf_doc.images[img_idx]
-                            relevant_images.append({
-                                "document": doc_filename,
-                                "page": img_data.page_number,
-                                "base64": img_data.base64_string,
-                                "ocr_text": img_data.ocr_text[:100] + "..." if len(img_data.ocr_text) > 100 else img_data.ocr_text
-                            })
+                with gr.Column(scale=1):
+                    # References section
+                    with gr.Group():
+                        gr.Markdown("### 📋 References")
+                        references = gr.Markdown(
+                            value="References will appear here after asking questions.",
+                            height=300
+                        )
+                    
+                    # Reference images gallery
+                    with gr.Group():
+                        gr.Markdown("### 🖼️ Reference Images")
+                        reference_images = gr.Gallery(
+                            label="Images from relevant sources",
+                            columns=2,
+                            rows=3,
+                            height=400,
+                            show_label=False,
+                            show_download_button=True,
+                            interactive=False
+                        )
+            
+            # Event handlers
+            upload_btn.click(
+                fn=self.upload_pdfs,
+                inputs=[file_upload],
+                outputs=[upload_status, references, reference_images],
+                show_progress=True
+            )
+            
+            submit_btn.click(
+                fn=self.chat,
+                inputs=[msg, chatbot],
+                outputs=[chatbot, references, reference_images],
+                show_progress=True
+            ).then(
+                lambda: gr.update(value=""),
+                outputs=[msg]
+            )
+            
+            msg.submit(
+                fn=self.chat,
+                inputs=[msg, chatbot],
+                outputs=[chatbot, references, reference_images],
+                show_progress=True
+            ).then(
+                lambda: gr.update(value=""),
+                outputs=[msg]
+            )
+            
+            clear_btn.click(
+                fn=self.clear_chat,
+                outputs=[chatbot, references, reference_images]
+            )
+            
+            # Add some example questions
+            gr.Markdown("""
+            ### 💡 Example Questions:
+            - "What does this document say about [topic]?"
+            - "Can you explain the chart/diagram on page X?"
+            - "What are the key findings mentioned?"
+            - "Summarize the methodology section"
+            """)
+        
+        return demo
+
+def main():
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    try:
+        # Create and launch the chatbot
+        chatbot_ui = ChatbotUI()
+        demo = chatbot_ui.create_interface()
+        
+        # Launch with sharing enabled
+        demo.launch(
+            server_name="0.0.0.0",
+            server_port=7860,
+            share=True,
+            debug=False,
+            show_error=True
+        )
+    
+    except Exception as e:
+        logging.error(f"Error launching application: {e}")
+        print(f"Failed to launch application: {e}")
 
-            # Extract citation info
-            citation_info = self._extract_cited_pages(answer)
-
-            # Add to conversation history
-            self.conversation_history.append((query, answer))
-
-            # Get all cited pages
-            all_pages = []
-            for doc_citations in citation_info.values():
-                for citation in doc_citations:
-                    all_pages.extend(citation["pages"])
-
-            return {
-                "answer": answer,
-                "citation_info": citation_info,
-                "cited_pages": sorted(list(set(all_pages))),
-                "source_docs": source_docs,
-                "relevant"relevant_images": relevant_images
-           }
-       except Exception as e:
-           logger.error(f"Error in ask method: {str(e)}")
-           return {
-               "answer": f"Error processing query: {str(e)}",
-               "citation_info": {},
-               "cited_pages": [],
-               "source_docs": [],
-               "relevant_images": []
-           }
-
-   def _extract_cited_pages(self, text: str) -> Dict[str, List[Dict[str, Any]]]:
-       """Extract citation information from the text."""
-       if not text:
-           return {}
-
-       citations = {}
-
-       # Updated pattern to handle image citations
-       doc_pattern = r'\[Document:\s*"([^"]+)",\s*Page(?:s)?\s*(\d+)(?:-(\d+))?(?:,\s*(?:Section\s*([^:]+):\s*"([^"]+)"|Image/Figure))?\]'
-
-       try:
-           for match in re.finditer(doc_pattern, text):
-               try:
-                   doc_name = match.group(1)
-                   start_page = int(match.group(2))
-                   end_page = int(match.group(3)) if match.group(3) else start_page
-                   pages = list(range(start_page, end_page + 1))
-
-                   section_num = match.group(4) if match.group(4) else None
-                   section_title = match.group(5) if match.group(5) else None
-
-                   if doc_name not in citations:
-                       citations[doc_name] = []
-
-                   citations[doc_name].append({
-                       "pages": pages,
-                       "section_num": section_num,
-                       "section_title": section_title
-                   })
-
-               except (ValueError, IndexError) as e:
-                   logger.error(f"Error parsing citation: {match.group(0)}, error: {str(e)}")
-                   continue
-
-           return citations
-       except Exception as e:
-           logger.error(f"Error extracting citations: {str(e)}")
-           return {}
-
-   def reset_conversation(self):
-       """Reset the conversation history."""
-       self.conversation_history = []
-       return "Conversation history has been reset."
-
-   def get_document_stats(self) -> Dict[str, Dict[str, Any]]:
-       """Get statistics about uploaded documents."""
-       stats = {}
-       for name, doc in self.documents.items():
-           stats[name] = {
-               "pages": len(doc.pages),
-               "chunks": len(doc.chunks),
-               "total_chars": len(doc.content),
-               "images": len(doc.images),
-               "images_with_ocr": sum(1 for img in doc.images if img.ocr_text)
-           }
-       return stats
-
-   def save_index(self, path: str):
-       """Save the FAISS index to disk."""
-       if self.hybrid_retriever:
-           return self.hybrid_retriever.save_index(path)
-       return "No index to save. Please upload documents first."
-
-class GradioRAGInterface:
-   """Gradio interface for the RAG system with image display support."""
-
-   def __init__(self):
-       self.rag_system = None
-       self.temp_dir = tempfile.mkdtemp()
-       self.vertex_gen_ai = None
-       self.setup_interface()
-
-   def setup_interface(self):
-       """Set up the Gradio interface."""
-       with gr.Blocks(theme=gr.themes.Base()) as self.interface:
-           gr.Markdown("# Advanced PDF Chat with Document, Page, Section Citations and Image References")
-
-           with gr.Row():
-               with gr.Column(scale=1):
-                   # System Configuration
-                   gr.Markdown("## 🤖 System Configuration")
-
-                   # VertexAI Settings
-                   with gr.Group():
-                       ca_bundle_path = gr.Textbox(
-                           label="CA Bundle Path (optional)",
-                           placeholder="Path to PROD CA pem file",
-                           value=""
-                       )
-                       initialize_vertex_btn = gr.Button("Initialize VertexAI", variant="primary")
-                       vertex_status = gr.Textbox(label="VertexAI Status", value="Not initialized")
-
-                   # Vector DB settings
-                   gr.Markdown("## 💾 Vector Database Settings")
-                   use_existing_db = gr.Checkbox(label="Use Existing FAISS Index", value=False)
-
-                   with gr.Group(visible=False) as faiss_settings:
-                       faiss_path = gr.Textbox(
-                           label="FAISS Index Path",
-                           placeholder="Path to existing FAISS index"
-                       )
-
-                   # OCR Settings
-                   gr.Markdown("## 🔍 OCR Settings")
-                   enable_ocr = gr.Checkbox(label="Enable OCR for Images", value=True)
-
-                   initialize_btn = gr.Button("Initialize System")
-
-                   # Document upload section
-                   gr.Markdown("## 📄 Upload Documents")
-                   pdf_upload = gr.File(
-                       label="Upload PDF Documents",
-                       file_types=[".pdf"],
-                       file_count="multiple"
-                   )
-                   upload_button = gr.Button("Process PDFs")
-                   save_index_button = gr.Button("Save FAISS Index")
-                   faiss_save_path = gr.Textbox(
-                       label="Save FAISS Index To",
-                       placeholder="Path to save the current FAISS index",
-                       value="/content/faiss_index"
-                   )
-                   doc_status = gr.Markdown("No documents uploaded yet.")
-
-                   # System controls
-                   gr.Markdown("## ⚙️ System Controls")
-                   reset_btn = gr.Button("Reset Conversation")
-
-               with gr.Column(scale=2):
-                   # Chat interface
-                   gr.Markdown("## 💬 Chat With Your Documents")
-                   chatbot = gr.Chatbot(height=400, elem_id="chatbot")
-                   msg = gr.Textbox(
-                       placeholder="Ask a question about your documents...",
-                       label="Your Question",
-                       lines=1
-                   )
-                   submit_btn = gr.Button("Ask", variant="primary")
-
-                   # Citation information with enhanced display
-                   gr.Markdown("## 📊 Citation Information")
-                   with gr.Accordion("Document References", open=True):
-                       citation_display = gr.JSON(label="Citations by Document")
-
-                   # Image references
-                   gr.Markdown("## 🖼️ Referenced Images")
-                   with gr.Accordion("Images from Documents", open=True):
-                       image_gallery = gr.Gallery(
-                           label="Relevant Images",
-                           show_label=True,
-                           elem_id="gallery",
-                           columns=2,
-                           rows=2,
-                           height="auto"
-                       )
-                       image_info = gr.JSON(label="Image Information")
-
-                   with gr.Accordion("Document Statistics", open=False):
-                       doc_stats = gr.JSON(label="Document Statistics")
-
-           # Set up event handlers for showing/hiding FAISS settings
-           use_existing_db.change(
-               fn=lambda x: gr.update(visible=x),
-               inputs=[use_existing_db],
-               outputs=[faiss_settings]
-           )
-
-           # Initialize VertexAI button
-           initialize_vertex_btn.click(
-               fn=self.initialize_vertex_ai,
-               inputs=[ca_bundle_path],
-               outputs=[vertex_status]
-           )
-
-           # Initialize system button logic
-           initialize_btn.click(
-               fn=self.initialize_system,
-               inputs=[
-                   use_existing_db,
-                   faiss_path,
-                   enable_ocr
-               ],
-               outputs=[doc_status]
-           )
-
-           # Save FAISS index button
-           save_index_button.click(
-               fn=self.save_faiss_index,
-               inputs=[faiss_save_path],
-               outputs=[doc_status]
-           )
-
-           # Add event handlers for existing functionality
-           upload_button.click(
-               fn=self.upload_documents,
-               inputs=[pdf_upload],
-               outputs=[doc_status, doc_stats]
-           )
-
-           # Chat handlers with image support
-           def safe_chat_handler(message, history):
-               try:
-                   if history is None:
-                       history = []
-                   result = self.chat_with_docs(message, history)
-                   return result
-               except Exception as e:
-                   logger.error(f"Error in chat handler: {str(e)}")
-                   if history is None:
-                       history = []
-                   return history + [[message, f"Error: {str(e)}"]], "", {}, [], {}
-
-           submit_btn.click(
-               fn=safe_chat_handler,
-               inputs=[msg, chatbot],
-               outputs=[chatbot, msg, citation_display, image_gallery, image_info]
-           )
-
-           msg.submit(
-               fn=safe_chat_handler,
-               inputs=[msg, chatbot],
-               outputs=[chatbot, msg, citation_display, image_gallery, image_info]
-           )
-
-           reset_btn.click(
-               fn=self.reset_chat,
-               inputs=[],
-               outputs=[chatbot, doc_status, citation_display, image_gallery, image_info]
-           )
-
-   def initialize_vertex_ai(self, ca_bundle_path):
-       """Initialize VertexAI instance."""
-       try:
-           # Set the CA bundle if provided
-           if ca_bundle_path and os.path.exists(ca_bundle_path):
-               os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle_path
-               logger.info(f"Set CA bundle path to: {ca_bundle_path}")
-               
-           self.vertex_gen_ai = VertexGenAI()
-           
-           # Test the connection with both generation and embedding
-           test_prompt = "Hello, this is a test."
-           test_response = self.vertex_gen_ai.generate_content(test_prompt)
-           test_embedding = self.vertex_gen_ai.get_embeddings([test_prompt])
-           
-           if test_response and test_embedding:
-               return "✅ VertexAI initialized successfully! Both generation and embeddings are working."
-           elif test_response:
-               return "⚠️ VertexAI generation works but embeddings failed. Check your embedding model access."
-           elif test_embedding:
-               return "⚠️ VertexAI embeddings work but generation failed. Check your generative model access."
-           else:
-               return "❌ VertexAI initialized but both generation and embeddings failed. Check your credentials and model access."
-               
-       except Exception as e:
-           return f"❌ Failed to initialize VertexAI: {str(e)}"
-
-   def initialize_system(self, use_existing_db, faiss_path, enable_ocr):
-       """Initialize the RAG system with settings."""
-
-       if not self.vertex_gen_ai:
-           return "Please initialize VertexAI first."
-
-       # Validate FAISS path if using existing DB
-       if use_existing_db and (not faiss_path or not os.path.exists(faiss_path)):
-           return "Please enter a valid path to an existing FAISS index."
-
-       try:
-           # Create the RAG system with appropriate settings
-           self.rag_system = AdvancedRAGSystem(
-               vertex_gen_ai=self.vertex_gen_ai,
-               faiss_index_path=faiss_path if use_existing_db else None,
-               enable_ocr=enable_ocr
-           )
-
-           ocr_status = "enabled" if enable_ocr else "disabled"
-           if use_existing_db:
-               return f"✅ System initialized with VertexAI using existing FAISS index at {faiss_path}! OCR is {ocr_status}."
-           else:
-               return f"✅ System initialized with VertexAI! OCR is {ocr_status}. You can now upload documents."
-
-       except Exception as e:
-           return f"❌ Error initializing system: {str(e)}"
-
-   def save_faiss_index(self, save_path):
-       """Save the current FAISS index to disk."""
-       if not self.rag_system or not self.rag_system.hybrid_retriever:
-           return "Please initialize the system and upload documents first."
-
-       if not save_path:
-           return "Please provide a valid path to save the FAISS index."
-
-       try:
-           result = self.rag_system.hybrid_retriever.save_index(save_path)
-           return f"✅ {result}"
-       except Exception as e:
-           return f"❌ Error saving FAISS index: {str(e)}"
-
-   def upload_documents(self, files):
-       """Upload and process documents."""
-       if not self.rag_system:
-           return "Please initialize the system first.", {}
-
-       if not files:
-           return "No files selected for upload.", {}
-
-       results = []
-
-       for file in files:
-           try:
-               result = self.rag_system.upload_pdf(file.name)
-               results.append(f"✅ {result}")
-           except Exception as e:
-               results.append(f"❌ Error processing {os.path.basename(file.name)}: {str(e)}")
-
-       # Get enhanced document stats for display
-       doc_stats = self._get_enhanced_doc_stats()
-
-       status = "## Document Processing Results\n" + "\n".join(results)
-       return status, doc_stats
-
-   def _get_enhanced_doc_stats(self):
-       """Get enhanced statistics about uploaded documents including image information."""
-       if not self.rag_system:
-           return {}
-
-       stats = {}
-       for name, doc in self.rag_system.documents.items():
-           # Count sections found per document
-           sections = set()
-           for chunk in doc.chunks:
-               for section_key, section_title in chunk.section_info.items():
-                   sections.add(f"{section_key}: {section_title}")
-
-           # Image statistics
-           images_with_text = sum(1 for img in doc.images if img.ocr_text)
-
-           stats[name] = {
-               "Total Pages": len(doc.pages),
-               "Total Chunks": len(doc.chunks),
-               "Characters": len(doc.content),
-               "Sections Found": len(sections),
-               "Section Examples": list(sections)[:5] if sections else "None found",
-               "Total Images": len(doc.images),
-               "Images with OCR Text": images_with_text
-           }
-       return stats
-
-   def chat_with_docs(self, message, history=None):
-       """Process a chat message and get a response with images."""
-       if history is None:
-           history = []
-
-       if not self.rag_system:
-           return history + [[message, "Please initialize the system and upload documents first."]], "", {}, [], {}
-
-       if not self.rag_system.documents:
-           return history + [[message, "Please upload at least one document before asking questions."]], "", {}, [], {}
-
-       if not message or not message.strip():
-           return history + [[message, "Please enter a question."]], "", {}, [], {}
-
-       try:
-           # Process the query
-           start_time = time.time()
-           response = self.rag_system.ask(message)
-           process_time = time.time() - start_time
-
-           answer = response["answer"]
-           citation_info = response.get("citation_info", {})
-           relevant_images = response.get("relevant_images", [])
-
-           # Add processing time info
-           answer += f"\n\n_Query processed in {process_time:.2f} seconds._"
-
-           # Update chatbot history
-           updated_history = list(history)
-           updated_history.append([message, answer])
-
-           # Format citation info for display
-           formatted_citations = {}
-           for doc_name, citations in citation_info.items():
-               doc_citations = []
-               for citation in citations:
-                   pages_str = "-".join(map(str, [min(citation["pages"]), max(citation["pages"])])) if len(citation["pages"]) > 1 else str(citation["pages"][0])
-                   section_info = ""
-                   if citation["section_num"] and citation["section_title"]:
-                       section_info = f", Section {citation['section_num']}: \"{citation['section_title']}\""
-                   elif citation["section_num"]:
-                       section_info = f", Section {citation['section_num']}"
-                   elif citation["section_title"]:
-                       section_info = f", Section: \"{citation['section_title']}\""
-
-                   doc_citations.append(f"Page(s) {pages_str}{section_info}")
-
-               formatted_citations[doc_name] = doc_citations
-
-           # Prepare images for gallery
-           gallery_images = []
-           image_details = []
-
-           for img_data in relevant_images:
-               # Convert base64 to PIL Image for gallery
-               img_bytes = base64.b64decode(img_data["base64"])
-               img = Image.open(BytesIO(img_bytes))
-               
-               # Add to gallery
-               gallery_images.append(img)
-               
-               # Add details
-               image_details.append({
-                   "document": img_data["document"],
-                   "page": img_data["page"],
-                   "ocr_preview": img_data["ocr_text"]
-               })
-
-           # Return results
-           page_info = {
-               "Citation Information": formatted_citations,
-               "Documents Referenced": len(citation_info),
-               "Images Found": len(relevant_images)
-           }
-
-           return updated_history, "", page_info, gallery_images, {"images": image_details}
-
-       except Exception as e:
-           logger.error(f"Error in chat: {str(e)}")
-           return history + [[message, f"Error: {str(e)}"]], "", {}, [], {}
-
-   def reset_chat(self):
-       """Reset the chat conversation."""
-       if self.rag_system:
-           self.rag_system.reset_conversation()
-
-       doc_status = "Conversation has been reset."
-       if self.rag_system and self.rag_system.documents:
-           doc_names = list(self.rag_system.documents.keys())
-           doc_status += f"\nLoaded documents: {', '.join(doc_names)}"
-
-       return [], doc_status, {}, [], {}
-
-# Helper function for Google Authentication
-def setup_google_auth():
-   """Set up Google authentication if using Vertex AI."""
-   try:
-       from google.colab import auth
-       auth.authenticate_user()
-       print("Google authentication completed successfully.")
-       return True
-   except ImportError:
-       print("Not running in Google Colab. Please ensure you're authenticated for Vertex AI.")
-       return False
-
-# Export the interface for easy import in Colab
-def launch_rag_interface():
-   """Launch the RAG interface."""
-   interface = GradioRAGInterface()
-   return interface.interface
-
-# Main entry point for running in Colab
 if __name__ == "__main__":
-   print("Starting Advanced PDF RAG System with VertexAI and Image Support")
-   
-   # Check if we're in Colab
-   try:
-       import google.colab
-       print("Running in Google Colab environment")
-
-       # Set up authentication
-       print("\n== Setting up Google Authentication ==")
-       if setup_google_auth():
-           print("Authentication successful!")
-       
-       # Create directories
-       os.makedirs("/content/faiss_index", exist_ok=True)
-       print("Created directory for FAISS indices at /content/faiss_index")
-
-       print("\n== IMPORTANT NOTES ==")
-       print("1. Click 'Initialize VertexAI' button first")
-       print("2. Optionally provide CA Bundle path if needed")
-       print("3. Make sure your Google Cloud project has Vertex AI API enabled")
-       print("4. The system will use your project's Vertex AI for embeddings and generation")
-       print("5. Images in PDFs will be extracted and OCR will be performed if enabled")
-       
-   except ImportError:
-       print("Not running in Google Colab environment")
-
-   # Launch the interface
-   interface = launch_rag_interface()
-   print("\nRAG System is running. Access the interface through the provided URL.")
+    main()
