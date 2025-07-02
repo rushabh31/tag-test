@@ -8,13 +8,6 @@ This notebook builds on the original Advanced RAG system, adding:
 4. Display of referenced images in responses
 """
 
-# Install required packages
-# !pip install langchain langchain-groq sentence-transformers faiss-cpu pypdf gradio tiktoken -q
-# !pip install -q pypdf langchain langchain_groq faiss-cpu langchain_community sentence-transformers chromadb tiktoken langchain_core
-# !pip install -q google-cloud-aiplatform langchain-google-vertexai
-# !pip install -q pdf2image pytesseract pillow opencv-python-headless
-# !apt-get install -y poppler-utils tesseract-ocr
-
 import os
 import re
 import tempfile
@@ -49,6 +42,7 @@ from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain.embeddings.base import Embeddings
 import gradio as gr
 
 # Your existing VertexAI code
@@ -395,13 +389,14 @@ class EnhancedPDFProcessor:
         doc = self.extract_text_from_pdf(file_path)
         return self.chunk_document(doc)
 
-class VertexAIEmbeddings:
-    """Custom embeddings class using VertexGenAI."""
+class VertexAIEmbeddings(Embeddings):
+    """Custom embeddings class using VertexGenAI that properly inherits from LangChain's Embeddings base class."""
     
     def __init__(self, vertex_gen_ai: VertexGenAI, model_name: str = "text-embedding-004"):
         self.vertex_gen_ai = vertex_gen_ai
         self.model_name = model_name
         self._embedding_dimension = None
+        super().__init__()
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Embed multiple documents."""
@@ -409,6 +404,8 @@ class VertexAIEmbeddings:
             return []
             
         try:
+            logger.info(f"Embedding {len(texts)} documents with VertexAI")
+            
             # Get embeddings from VertexGenAI
             embeddings_response = self.vertex_gen_ai.get_embeddings(texts, self.model_name)
             
@@ -425,6 +422,7 @@ class VertexAIEmbeddings:
             # Set embedding dimension if not already set
             if embeddings and self._embedding_dimension is None:
                 self._embedding_dimension = len(embeddings[0])
+                logger.info(f"Set embedding dimension to {self._embedding_dimension}")
                 
             return embeddings
             
@@ -439,6 +437,8 @@ class VertexAIEmbeddings:
             return self._get_zero_vector()
             
         try:
+            logger.info(f"Embedding query with VertexAI: {text[:50]}...")
+            
             # Get embedding for single text
             embeddings_response = self.vertex_gen_ai.get_embeddings([text], self.model_name)
             
@@ -449,6 +449,7 @@ class VertexAIEmbeddings:
                     # Update dimension if needed
                     if self._embedding_dimension is None:
                         self._embedding_dimension = len(vector)
+                        logger.info(f"Set embedding dimension to {self._embedding_dimension}")
                     return vector
                     
             return self._get_zero_vector()
@@ -478,40 +479,77 @@ class HybridRetriever:
                  faiss_index_path: str = None, vertex_gen_ai: VertexGenAI = None):
         """Initialize retriever with documents or existing FAISS index."""
         
-        if vertex_gen_ai:
-            self.embeddings = VertexAIEmbeddings(vertex_gen_ai)
-        else:
-            # Fallback to sentence transformers if VertexGenAI not provided
-            self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+        logger.info("Initializing HybridRetriever...")
+        
+        try:
+            if vertex_gen_ai:
+                logger.info("Using VertexAI embeddings")
+                self.embeddings = VertexAIEmbeddings(vertex_gen_ai)
+            else:
+                logger.info("Falling back to SentenceTransformer embeddings")
+                self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
-        if faiss_index_path and os.path.exists(faiss_index_path):
-            self.vector_store = FAISS.load_local(faiss_index_path, self.embeddings, allow_dangerous_deserialization=True)
-            logger.info(f"Loaded existing FAISS index from {faiss_index_path}")
-        elif documents:
-            self.vector_store = FAISS.from_documents(documents, self.embeddings)
-            logger.info("Created new FAISS index from documents")
-        else:
-            self.vector_store = FAISS.from_texts(["placeholder"], self.embeddings)
-            logger.info("Created empty FAISS index")
+            # Initialize vector store
+            if faiss_index_path and os.path.exists(faiss_index_path):
+                logger.info(f"Loading existing FAISS index from {faiss_index_path}")
+                self.vector_store = FAISS.load_local(
+                    faiss_index_path, 
+                    self.embeddings, 
+                    allow_dangerous_deserialization=True
+                )
+                logger.info("Successfully loaded existing FAISS index")
+            elif documents and len(documents) > 0:
+                logger.info(f"Creating new FAISS index from {len(documents)} documents")
+                self.vector_store = FAISS.from_documents(documents, self.embeddings)
+                logger.info("Successfully created new FAISS index")
+            else:
+                logger.info("Creating empty FAISS index with placeholder")
+                self.vector_store = FAISS.from_texts(["placeholder"], self.embeddings)
+                logger.info("Created empty FAISS index")
 
-        self.retriever = self.vector_store.as_retriever(
-            search_type="mmr" if use_mmr else "similarity",
-            search_kwargs={"k": 6, "fetch_k": 10} if use_mmr else {"k": 5}
-        )
+            # Configure retriever
+            search_kwargs = {"k": 6, "fetch_k": 10} if use_mmr else {"k": 5}
+            self.retriever = self.vector_store.as_retriever(
+                search_type="mmr" if use_mmr else "similarity",
+                search_kwargs=search_kwargs
+            )
+            logger.info(f"Configured retriever with search_type={'mmr' if use_mmr else 'similarity'}")
+            
+        except Exception as e:
+            logger.error(f"Error initializing HybridRetriever: {str(e)}")
+            raise
 
     def get_relevant_documents(self, query: str, top_k: int = 5) -> List[Document]:
         """Get relevant documents using hybrid search."""
-        return self.retriever.get_relevant_documents(query)
+        try:
+            logger.info(f"Retrieving documents for query: {query[:50]}...")
+            docs = self.retriever.get_relevant_documents(query)
+            logger.info(f"Retrieved {len(docs)} documents")
+            return docs
+        except Exception as e:
+            logger.error(f"Error in get_relevant_documents: {str(e)}")
+            return []
 
     def update_documents(self, documents: List[Document]):
         """Update the document store with new documents."""
-        self.vector_store.add_documents(documents)
+        try:
+            logger.info(f"Adding {len(documents)} new documents to vector store")
+            self.vector_store.add_documents(documents)
+            logger.info("Successfully added documents to vector store")
+        except Exception as e:
+            logger.error(f"Error updating documents: {str(e)}")
+            raise
 
     def save_index(self, path: str):
         """Save the FAISS index to disk."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self.vector_store.save_local(path)
-        return f"Saved FAISS index to {path}"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.vector_store.save_local(path)
+            logger.info(f"Saved FAISS index to {path}")
+            return f"Saved FAISS index to {path}"
+        except Exception as e:
+            logger.error(f"Error saving index: {str(e)}")
+            raise
 
 class AdvancedRAGSystem:
     """Enhanced RAG system with VertexAI integration and image support."""
@@ -521,6 +559,8 @@ class AdvancedRAGSystem:
                  faiss_index_path: str = None,
                  enable_ocr: bool = True):
 
+        logger.info("Initializing AdvancedRAGSystem...")
+        
         self.vertex_gen_ai = vertex_gen_ai
         self.enable_ocr = enable_ocr
 
@@ -538,21 +578,29 @@ class AdvancedRAGSystem:
 
         # If we have a FAISS path, initialize the retriever
         if faiss_index_path and os.path.exists(faiss_index_path):
-            self.hybrid_retriever = HybridRetriever(
-                faiss_index_path=faiss_index_path,
-                vertex_gen_ai=vertex_gen_ai
-            )
+            try:
+                self.hybrid_retriever = HybridRetriever(
+                    faiss_index_path=faiss_index_path,
+                    vertex_gen_ai=vertex_gen_ai
+                )
+                logger.info("Initialized retriever with existing FAISS index")
+            except Exception as e:
+                logger.error(f"Error loading existing FAISS index: {str(e)}")
 
         self.conversation_history = []
         self.conversation_chain = None
 
         # Initialize conversation chain if we have VertexGenAI
         if vertex_gen_ai:
-            self._initialize_conversation_chain()
+            logger.info("VertexGenAI provided, system ready for initialization")
+        else:
+            logger.warning("No VertexGenAI instance provided")
 
     def upload_pdf(self, file_path: str) -> str:
         """Process and index a PDF document with image extraction."""
         try:
+            logger.info(f"Processing PDF: {file_path}")
+            
             # Process the document
             doc = self.processor.process_pdf(file_path)
 
@@ -563,29 +611,45 @@ class AdvancedRAGSystem:
             self._update_retrievers()
 
             image_count = len(doc.images)
-            return f"Processed and indexed {doc.filename} ({len(doc.pages)} pages, {len(doc.chunks)} chunks, {image_count} images extracted)"
+            result = f"Processed and indexed {doc.filename} ({len(doc.pages)} pages, {len(doc.chunks)} chunks, {image_count} images extracted)"
+            logger.info(result)
+            return result
         except Exception as e:
-            logger.error(f"Error uploading PDF: {str(e)}")
-            raise
+            error_msg = f"Error uploading PDF: {str(e)}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
 
     def _update_retrievers(self):
         """Update the retriever system with current documents."""
-        all_docs = []
-        for doc in self.documents.values():
-            all_docs.extend(doc.langchain_documents)
+        try:
+            logger.info("Updating retrievers with current documents...")
+            
+            all_docs = []
+            for doc in self.documents.values():
+                all_docs.extend(doc.langchain_documents)
 
-        if not all_docs:
-            return
+            if not all_docs:
+                logger.warning("No documents to update retrievers with")
+                return
 
-        if not self.hybrid_retriever:
-            self.hybrid_retriever = HybridRetriever(
-                all_docs,
-                vertex_gen_ai=self.vertex_gen_ai
-            )
-        else:
-            self.hybrid_retriever.update_documents(all_docs)
+            logger.info(f"Total documents to index: {len(all_docs)}")
 
-        self._initialize_conversation_chain()
+            if not self.hybrid_retriever:
+                logger.info("Creating new HybridRetriever")
+                self.hybrid_retriever = HybridRetriever(
+                    all_docs,
+                    vertex_gen_ai=self.vertex_gen_ai
+                )
+            else:
+                logger.info("Updating existing HybridRetriever")
+                self.hybrid_retriever.update_documents(all_docs)
+
+            # Initialize conversation chain
+            self._initialize_conversation_chain()
+            
+        except Exception as e:
+            logger.error(f"Error updating retrievers: {str(e)}")
+            raise
 
     def _create_custom_chain(self, retriever):
         """Create a custom chain that handles our specific prompt format."""
@@ -612,6 +676,8 @@ Content: {content}{image_note}
         
         def custom_chain(inputs):
             try:
+                logger.info(f"Processing query in custom chain: {inputs.get('question', '')[:50]}...")
+                
                 # Get relevant documents
                 docs = retriever.get_relevant_documents(inputs["question"])
                 
@@ -650,11 +716,13 @@ Citation Format Requirements:
 Answer the question using ONLY the provided context:"""
                 
                 # Generate response using VertexGenAI
+                logger.info("Generating response with VertexGenAI...")
                 response_text = self.vertex_gen_ai.generate_content(prompt)
                 
                 if not response_text:
                     response_text = "I apologize, but I couldn't generate a response. Please try rephrasing your question."
                 
+                logger.info("Successfully generated response")
                 return {
                     "answer": response_text,
                     "source_documents": docs
@@ -671,92 +739,122 @@ Answer the question using ONLY the provided context:"""
 
     def _initialize_conversation_chain(self):
         """Initialize the conversation chain with VertexGenAI."""
-        if not self.hybrid_retriever or not self.vertex_gen_ai:
-            logger.warning("Missing retriever or VertexGenAI instance")
-            return
-
-        # Create a custom chain since VertexGenAI has a different interface
-        self.conversation_chain = self._create_custom_chain(self.hybrid_retriever.retriever)
-
-    def ask(self, query: str) -> Dict[str, Any]:
-        """Process a query and return answer with citations and relevant images."""
-        if not self.hybrid_retriever or not self.conversation_chain:
-            return {"answer": "Please upload at least one document first.", "relevant_images": []}
-
         try:
-            # Execute the chain
-            result = self.conversation_chain({"question": query})
-
-            # Extract answer
-            answer = result.get("answer", "No answer generated")
-            source_docs = result.get("source_documents", [])
-
-            # Find relevant images from source documents
-            relevant_images = []
-            for doc in source_docs:
-                metadata = doc.metadata
-                doc_filename = metadata.get("source", "")
-                image_refs = metadata.get("image_refs", [])
+            if not self.hybrid_retriever:
+                logger.warning("No hybrid retriever available for conversation chain")
+                return
                 
-                # Get the document
-                if doc_filename in self.documents:
-                    pdf_doc = self.documents[doc_filename]
-                    for img_idx in image_refs:
-                        if img_idx < len(pdf_doc.images):
-                            img_data = pdf_doc.images[img_idx]
-                            relevant_images.append({
-                                "document": doc_filename,
-                                "page": img_data.page_number,
-                                "base64": img_data.base64_string,
-                                "ocr_text": img_data.ocr_text[:100] + "..." if len(img_data.ocr_text) > 100 else img_data.ocr_text
-                            })
+            if not self.vertex_gen_ai:
+                logger.warning("No VertexGenAI instance available for conversation chain")
+                return
 
-            # Extract citation info
-            citation_info = self._extract_cited_pages(answer)
+            logger.info("Initializing conversation chain...")
+            
+            # Create a custom chain since VertexGenAI has a different interface
+            self.conversation_chain = self._create_custom_chain(self.hybrid_retriever.retriever)
+            
+            logger.info("Successfully initialized conversation chain")
+            except Exception as e:
+           logger.error(f"Error initializing conversation chain: {str(e)}")
 
-            # Add to conversation history
-            self.conversation_history.append((query, answer))
+   def ask(self, query: str) -> Dict[str, Any]:
+       """Process a query and return answer with citations and relevant images."""
+       if not self.hybrid_retriever:
+           return {
+               "answer": "Please upload at least one document first. No retriever available.",
+               "citation_info": {},
+               "cited_pages": [],
+               "source_docs": [],
+               "relevant_images": []
+           }
+           
+       if not self.conversation_chain:
+           return {
+               "answer": "System not properly initialized. Please check VertexAI connection and upload documents.",
+               "citation_info": {},
+               "cited_pages": [],
+               "source_docs": [],
+               "relevant_images": []
+           }
 
-            # Get all cited pages
-            all_pages = []
-            for doc_citations in citation_info.values():
-                for citation in doc_citations:
-                    all_pages.extend(citation["pages"])
+       try:
+           logger.info(f"Processing query: {query[:50]}...")
+           
+           # Execute the chain
+           result = self.conversation_chain({"question": query})
 
-            return {
-                "answer": answer,
-                "citation_info": citation_info,
-                "cited_pages": sorted(list(set(all_pages))),
-                "source_docs": source_docs,
-                "relevant_images": relevant_images
-            }
-        except Exception as e:
-            logger.error(f"Error in ask method: {str(e)}")
-            return {
-                "answer": f"Error processing query: {str(e)}",
-                "citation_info": {},
-                "cited_pages": [],
-                "source_docs": [],
-                "relevant_images": []
-            }
+           # Extract answer
+           answer = result.get("answer", "No answer generated")
+           source_docs = result.get("source_documents", [])
 
-    def _extract_cited_pages(self, text: str) -> Dict[str, List[Dict[str, Any]]]:
-        """Extract citation information from the text."""
-        if not text:
-            return {}
+           # Find relevant images from source documents
+           relevant_images = []
+           for doc in source_docs:
+               metadata = doc.metadata
+               doc_filename = metadata.get("source", "")
+               image_refs = metadata.get("image_refs", [])
+               
+               # Get the document
+               if doc_filename in self.documents:
+                   pdf_doc = self.documents[doc_filename]
+                   for img_idx in image_refs:
+                       if img_idx < len(pdf_doc.images):
+                           img_data = pdf_doc.images[img_idx]
+                           relevant_images.append({
+                               "document": doc_filename,
+                               "page": img_data.page_number,
+                               "base64": img_data.base64_string,
+                               "ocr_text": img_data.ocr_text[:100] + "..." if len(img_data.ocr_text) > 100 else img_data.ocr_text
+                           })
 
-        citations = {}
+           # Extract citation info
+           citation_info = self._extract_cited_pages(answer)
 
-        # Updated pattern to handle image citations
-        doc_pattern = r'\[Document:\s*"([^"]+)",\s*Page(?:s)?\s*(\d+)(?:-(\d+))?(?:,\s*(?:Section\s*([^:]+):\s*"([^"]+)"|Image/Figure))?\]'
+           # Add to conversation history
+           self.conversation_history.append((query, answer))
 
-        try:
-            for match in re.finditer(doc_pattern, text):
-                try:
-                    doc_name = match.group(1)
-                    start_page = int(match.group(2))
-                    end_page = int(match.group(3)) if match.group(3) else start_page
-                    pages = list(range(start_page, end_page + 1))
+           # Get all cited pages
+           all_pages = []
+           for doc_citations in citation_info.values():
+               for citation in doc_citations:
+                   all_pages.extend(citation["pages"])
+
+           logger.info(f"Successfully processed query. Found {len(relevant_images)} relevant images.")
+
+           return {
+               "answer": answer,
+               "citation_info": citation_info,
+               "cited_pages": sorted(list(set(all_pages))),
+               "source_docs": source_docs,
+               "relevant_images": relevant_images
+           }
+       except Exception as e:
+           logger.error(f"Error in ask method: {str(e)}")
+           return {
+               "answer": f"Error processing query: {str(e)}",
+               "citation_info": {},
+               "cited_pages": [],
+               "source_docs": [],
+               "relevant_images": []
+           }
+
+   def _extract_cited_pages(self, text: str) -> Dict[str, List[Dict[str, Any]]]:
+       """Extract citation information from the text."""
+       if not text:
+           return {}
+
+       citations = {}
+
+       # Updated pattern to handle image citations
+       doc_pattern = r'\[Document:\s*"([^"]+)",\s*Page(?:s)?\s*(\d+)(?:-(\d+))?(?:,\s*(?:Section\s*([^:]+):\s*"([^"]+)"|Image/Figure))?\]'
+
+       try:
+           for match in re.finditer(doc_pattern, text):
+               try:
+                   doc_name = match.group(1)
+                   start_page = int(match.group(2))
+                   end_page = int(match.group(3)) if match.group(3) else start_page
+                   pages = list(range(start_page, end_page + 1))
 
                    section_num = match.group(4) if match.group(4) else None
                    section_title = match.group(5) if match.group(5) else None
@@ -782,6 +880,7 @@ Answer the question using ONLY the provided context:"""
    def reset_conversation(self):
        """Reset the conversation history."""
        self.conversation_history = []
+       logger.info("Conversation history reset")
        return "Conversation history has been reset."
 
    def get_document_stats(self) -> Dict[str, Dict[str, Any]]:
@@ -810,6 +909,7 @@ class GradioRAGInterface:
        self.rag_system = None
        self.temp_dir = tempfile.mkdtemp()
        self.vertex_gen_ai = None
+       logger.info("Initialized GradioRAGInterface")
        self.setup_interface()
 
    def setup_interface(self):
@@ -973,41 +1073,64 @@ class GradioRAGInterface:
    def initialize_vertex_ai(self, ca_bundle_path):
        """Initialize VertexAI instance."""
        try:
+           logger.info("Initializing VertexAI...")
+           
            # Set the CA bundle if provided
            if ca_bundle_path and os.path.exists(ca_bundle_path):
                os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle_path
                logger.info(f"Set CA bundle path to: {ca_bundle_path}")
-               
+           
+           # Initialize VertexGenAI
            self.vertex_gen_ai = VertexGenAI()
            
            # Test the connection with both generation and embedding
+           logger.info("Testing VertexAI connection...")
            test_prompt = "Hello, this is a test."
-           test_response = self.vertex_gen_ai.generate_content(test_prompt)
-           test_embedding = self.vertex_gen_ai.get_embeddings([test_prompt])
            
-           if test_response and test_embedding:
+           try:
+               test_response = self.vertex_gen_ai.generate_content(test_prompt)
+               generation_works = bool(test_response)
+           except Exception as e:
+               logger.error(f"Generation test failed: {str(e)}")
+               generation_works = False
+           
+           try:
+               test_embedding = self.vertex_gen_ai.get_embeddings([test_prompt])
+               embeddings_work = bool(test_embedding and len(test_embedding) > 0)
+           except Exception as e:
+               logger.error(f"Embeddings test failed: {str(e)}")
+               embeddings_work = False
+           
+           if generation_works and embeddings_work:
+               logger.info("VertexAI initialization successful")
                return "✅ VertexAI initialized successfully! Both generation and embeddings are working."
-           elif test_response:
+           elif generation_works:
+               logger.warning("VertexAI generation works but embeddings failed")
                return "⚠️ VertexAI generation works but embeddings failed. Check your embedding model access."
-           elif test_embedding:
+           elif embeddings_work:
+               logger.warning("VertexAI embeddings work but generation failed")
                return "⚠️ VertexAI embeddings work but generation failed. Check your generative model access."
            else:
+               logger.error("Both VertexAI generation and embeddings failed")
                return "❌ VertexAI initialized but both generation and embeddings failed. Check your credentials and model access."
                
        except Exception as e:
-           return f"❌ Failed to initialize VertexAI: {str(e)}"
+           error_msg = f"❌ Failed to initialize VertexAI: {str(e)}"
+           logger.error(error_msg)
+           return error_msg
 
    def initialize_system(self, use_existing_db, faiss_path, enable_ocr):
        """Initialize the RAG system with settings."""
-
-       if not self.vertex_gen_ai:
-           return "Please initialize VertexAI first."
-
-       # Validate FAISS path if using existing DB
-       if use_existing_db and (not faiss_path or not os.path.exists(faiss_path)):
-           return "Please enter a valid path to an existing FAISS index."
-
        try:
+           logger.info("Initializing RAG system...")
+
+           if not self.vertex_gen_ai:
+               return "Please initialize VertexAI first."
+
+           # Validate FAISS path if using existing DB
+           if use_existing_db and (not faiss_path or not os.path.exists(faiss_path)):
+               return "Please enter a valid path to an existing FAISS index."
+
            # Create the RAG system with appropriate settings
            self.rag_system = AdvancedRAGSystem(
                vertex_gen_ai=self.vertex_gen_ai,
@@ -1017,12 +1140,17 @@ class GradioRAGInterface:
 
            ocr_status = "enabled" if enable_ocr else "disabled"
            if use_existing_db:
-               return f"✅ System initialized with VertexAI using existing FAISS index at {faiss_path}! OCR is {ocr_status}."
+               result = f"✅ System initialized with VertexAI using existing FAISS index at {faiss_path}! OCR is {ocr_status}."
            else:
-               return f"✅ System initialized with VertexAI! OCR is {ocr_status}. You can now upload documents."
+               result = f"✅ System initialized with VertexAI! OCR is {ocr_status}. You can now upload documents."
+           
+           logger.info("RAG system initialization successful")
+           return result
 
        except Exception as e:
-           return f"❌ Error initializing system: {str(e)}"
+           error_msg = f"❌ Error initializing system: {str(e)}"
+           logger.error(error_msg)
+           return error_msg
 
    def save_faiss_index(self, save_path):
        """Save the current FAISS index to disk."""
@@ -1053,7 +1181,9 @@ class GradioRAGInterface:
                result = self.rag_system.upload_pdf(file.name)
                results.append(f"✅ {result}")
            except Exception as e:
-               results.append(f"❌ Error processing {os.path.basename(file.name)}: {str(e)}")
+               error_msg = f"❌ Error processing {os.path.basename(file.name)}: {str(e)}"
+               results.append(error_msg)
+               logger.error(error_msg)
 
        # Get enhanced document stats for display
        doc_stats = self._get_enhanced_doc_stats()
@@ -1103,6 +1233,8 @@ class GradioRAGInterface:
            return history + [[message, "Please enter a question."]], "", {}, [], {}
 
        try:
+           logger.info(f"Processing chat message: {message[:50]}...")
+           
            # Process the query
            start_time = time.time()
            response = self.rag_system.ask(message)
@@ -1142,19 +1274,22 @@ class GradioRAGInterface:
            image_details = []
 
            for img_data in relevant_images:
-               # Convert base64 to PIL Image for gallery
-               img_bytes = base64.b64decode(img_data["base64"])
-               img = Image.open(BytesIO(img_bytes))
-               
-               # Add to gallery
-               gallery_images.append(img)
-               
-               # Add details
-               image_details.append({
-                   "document": img_data["document"],
-                   "page": img_data["page"],
-                   "ocr_preview": img_data["ocr_text"]
-               })
+               try:
+                   # Convert base64 to PIL Image for gallery
+                   img_bytes = base64.b64decode(img_data["base64"])
+                   img = Image.open(BytesIO(img_bytes))
+                   
+                   # Add to gallery
+                   gallery_images.append(img)
+                   
+                   # Add details
+                   image_details.append({
+                       "document": img_data["document"],
+                       "page": img_data["page"],
+                       "ocr_preview": img_data["ocr_text"]
+                   })
+               except Exception as e:
+                   logger.error(f"Error processing image for gallery: {str(e)}")
 
            # Return results
            page_info = {
@@ -1163,11 +1298,13 @@ class GradioRAGInterface:
                "Images Found": len(relevant_images)
            }
 
+           logger.info(f"Successfully processed chat message. Found {len(relevant_images)} images.")
            return updated_history, "", page_info, gallery_images, {"images": image_details}
 
        except Exception as e:
+           error_msg = f"Error: {str(e)}"
            logger.error(f"Error in chat: {str(e)}")
-           return history + [[message, f"Error: {str(e)}"]], "", {}, [], {}
+           return history + [[message, error_msg]], "", {}, [], {}
 
    def reset_chat(self):
        """Reset the chat conversation."""
