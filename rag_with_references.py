@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Advanced-RAG-with-References-Extended-with-Images.ipynb
+"""Highly-Accurate-RAG-with-Hybrid-Retrieval-and-Reranking.ipynb
 
-This notebook builds on the original Advanced RAG system, adding:
-1. Support for loading/saving FAISS vector databases  
-2. Integration with your custom Vertex AI implementation
-3. Image extraction and OCR capabilities for PDFs
-4. Display of referenced images in responses
+Enhanced RAG system with:
+1. Hybrid retrieval (Dense HNSW + Sparse BM25)
+2. Cross-encoder reranking for accuracy
+3. Semantic image-text matching
+4. Multi-stage relevance filtering
+5. Query expansion and refinement
+6. Better chunking and context preservation
 """
 
 import os
@@ -21,6 +23,9 @@ import time
 import logging
 import base64
 from io import BytesIO
+import hashlib
+from collections import defaultdict
+import math
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,16 +37,13 @@ import pytesseract
 from PIL import Image
 import cv2
 
+# Enhanced retrieval libraries
+import hnswlib
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer, CrossEncoder
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS, Chroma
-from langchain.chains import ConversationalRetrievalChain, create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.prompts import PromptTemplate, ChatPromptTemplate
 from langchain.schema import Document
-from langchain_community.embeddings import SentenceTransformerEmbeddings
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
 from langchain.embeddings.base import Embeddings
 import gradio as gr
 
@@ -84,313 +86,658 @@ class VertexGenAI:
         return embeddings
 
 @dataclass
-class ImageData:
-    """Store extracted image data."""
+class EnhancedImageData:
+    """Enhanced image data with semantic analysis."""
     image: Image.Image
     page_number: int
-    bbox: Optional[Tuple[int, int, int, int]] = None  # Bounding box coordinates
+    bbox: Optional[Tuple[int, int, int, int]] = None
     ocr_text: str = ""
     base64_string: str = ""
+    image_type: str = ""
+    analysis: str = ""
+    confidence: float = 0.0
+    semantic_keywords: List[str] = field(default_factory=list)
+    embedding: Optional[List[float]] = None
+    context_text: str = ""  # Surrounding text context
 
 @dataclass
-class PageChunk:
-    """Store chunk information with precise page tracking and image references."""
+class EnhancedChunk:
+    """Enhanced chunk with better context preservation."""
     text: str
     page_numbers: List[int]
     start_char_idx: int
     end_char_idx: int
     filename: str
     section_info: Dict[str, str] = field(default_factory=dict)
-    image_refs: List[int] = field(default_factory=list)  # References to images by index
+    image_refs: List[int] = field(default_factory=list)
+    chunk_hash: str = ""
+    context_before: str = ""  # Context before this chunk
+    context_after: str = ""   # Context after this chunk
+    semantic_density: float = 0.0  # Measure of information density
+    
+    def __post_init__(self):
+        content = f"{self.text}{self.filename}{self.page_numbers}"
+        self.chunk_hash = hashlib.md5(content.encode()).hexdigest()[:8]
+        
+        # Calculate semantic density (keywords per sentence ratio)
+        sentences = len([s for s in self.text.split('.') if s.strip()])
+        words = len(self.text.split())
+        self.semantic_density = words / max(sentences, 1)
 
     def to_document(self) -> Document:
-        """Convert to LangChain Document."""
+        # Include more context in the document
+        enhanced_content = f"{self.context_before}\n\n{self.text}\n\n{self.context_after}".strip()
+        
         return Document(
-            page_content=self.text,
+            page_content=enhanced_content,
             metadata={
                 "page_numbers": self.page_numbers,
                 "source": self.filename,
                 "start_idx": self.start_char_idx,
                 "end_idx": self.end_char_idx,
                 "section_info": self.section_info,
-                "image_refs": self.image_refs
+                "image_refs": self.image_refs,
+                "chunk_hash": self.chunk_hash,
+                "semantic_density": self.semantic_density,
+                "original_text": self.text  # Keep original for reference
             }
         )
 
 @dataclass
 class PDFDocument:
-    """Enhanced class to store PDF document metadata, content, and images."""
+    """Enhanced PDF document."""
     filename: str
     content: str = ""
     pages: Dict[int, str] = field(default_factory=dict)
     char_to_page_map: List[int] = field(default_factory=list)
-    chunks: List[PageChunk] = field(default_factory=list)
-    images: List[ImageData] = field(default_factory=list)
-    image_to_page_map: Dict[int, int] = field(default_factory=dict)  # Image index to page number
-
-    def __len__(self) -> int:
-        return len(self.content)
+    chunks: List[EnhancedChunk] = field(default_factory=list)
+    images: List[EnhancedImageData] = field(default_factory=list)
+    page_to_images: Dict[int, List[int]] = field(default_factory=dict)
+    semantic_sections: Dict[str, List[int]] = field(default_factory=dict)
 
     @property
     def langchain_documents(self) -> List[Document]:
-        """Convert chunks to LangChain Documents."""
         return [chunk.to_document() for chunk in self.chunks]
 
-class EnhancedPDFProcessor:
-    """Advanced PDF processor with image extraction and OCR capabilities."""
+class SemanticImageMatcher:
+    """Semantic matching between queries and images."""
+    
+    def __init__(self):
+        # Load a lightweight sentence transformer for image-text matching
+        try:
+            self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Loaded sentence transformer for image matching")
+        except Exception as e:
+            logger.warning(f"Could not load sentence transformer: {e}")
+            self.sentence_model = None
+    
+    def extract_keywords(self, text: str) -> List[str]:
+        """Extract semantic keywords from text."""
+        # Simple keyword extraction - could be enhanced with NER
+        keywords = []
+        
+        # Domain-specific keywords
+        chart_keywords = ['chart', 'graph', 'plot', 'data', 'trend', 'axis', 'value', 'percent', 'rate']
+        table_keywords = ['table', 'row', 'column', 'cell', 'data', 'list', 'entry']
+        diagram_keywords = ['diagram', 'flow', 'process', 'step', 'arrow', 'connection', 'structure']
+        
+        text_lower = text.lower()
+        
+        for word_list, type_name in [(chart_keywords, 'chart'), (table_keywords, 'table'), (diagram_keywords, 'diagram')]:
+            if any(word in text_lower for word in word_list):
+                keywords.extend([w for w in word_list if w in text_lower])
+        
+        # Extract numbers and percentages
+        numbers = re.findall(r'\d+\.?\d*%?', text)
+        keywords.extend(numbers[:5])  # Limit to first 5 numbers
+        
+        return list(set(keywords))
+    
+    def calculate_image_relevance(self, query: str, image: EnhancedImageData) -> float:
+        """Calculate semantic relevance between query and image."""
+        if not self.sentence_model:
+            # Fallback to keyword matching
+            return self._keyword_similarity(query, image)
+        
+        try:
+            # Get embeddings
+            query_embedding = self.sentence_model.encode([query])[0]
+            
+            # Combine OCR text and analysis for image representation
+            image_text = f"{image.ocr_text} {image.analysis} {' '.join(image.semantic_keywords)}"
+            if not image_text.strip():
+                return 0.0
+                
+            image_embedding = self.sentence_model.encode([image_text])[0]
+            
+            # Calculate cosine similarity
+            similarity = np.dot(query_embedding, image_embedding) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(image_embedding)
+            )
+            
+            # Boost score based on image confidence and type relevance
+            type_boost = self._get_type_relevance_boost(query, image.image_type)
+            confidence_boost = image.confidence * 0.3
+            
+            final_score = similarity + type_boost + confidence_boost
+            return min(final_score, 1.0)
+            
+        except Exception as e:
+            logger.error(f"Error calculating image relevance: {e}")
+            return self._keyword_similarity(query, image)
+    
+    def _keyword_similarity(self, query: str, image: EnhancedImageData) -> float:
+        """Fallback keyword-based similarity."""
+        query_words = set(query.lower().split())
+        image_words = set(image.ocr_text.lower().split()) | set(image.semantic_keywords)
+        
+        if not image_words:
+            return 0.0
+            
+        intersection = query_words & image_words
+        union = query_words | image_words
+        
+        jaccard_sim = len(intersection) / len(union) if union else 0.0
+        return jaccard_sim * image.confidence
+    
+    def _get_type_relevance_boost(self, query: str, image_type: str) -> float:
+        """Boost score based on query-image type relevance."""
+        query_lower = query.lower()
+        
+        type_boosts = {
+            'chart': 0.2 if any(word in query_lower for word in ['chart', 'graph', 'data', 'trend', 'statistics']) else 0.0,
+            'table': 0.2 if any(word in query_lower for word in ['table', 'data', 'list', 'comparison']) else 0.0,
+            'diagram': 0.2 if any(word in query_lower for word in ['diagram', 'process', 'flow', 'structure']) else 0.0,
+            'figure': 0.1  # General boost for figures
+        }
+        
+        return type_boosts.get(image_type, 0.0)
 
-    def __init__(self,
-                 chunk_size: int = 1000,
-                 chunk_overlap: int = 200,
-                 separator: str = "\n\n",
-                 keep_separator: bool = False,
-                 enable_ocr: bool = True):
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.separator = separator
-        self.keep_separator = keep_separator
-        self.enable_ocr = enable_ocr
+class AdvancedPDFProcessor:
+    """Advanced PDF processor with enhanced chunking and image analysis."""
 
-        # Create a text splitter with careful configuration
+    def __init__(self):
+        self.chunk_size = 600  # Smaller chunks for better precision
+        self.chunk_overlap = 150  # More overlap for context preservation
+        self.context_window = 200  # Characters of context before/after chunks
+        
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
             length_function=len,
-            separators=["\n\n", "\n", " ", ""],
-            keep_separator=keep_separator
+            separators=["\n\n", "\n", ". ", " ", ""],
+            keep_separator=True
         )
-
-        # Regex patterns for section detection
+        
+        self.image_matcher = SemanticImageMatcher()
+        
+        # Enhanced section patterns
         self.section_patterns = [
             r'(?:Section|SECTION|Chapter|CHAPTER)\s+(\d+(?:\.\d+)*)[:\s]+(.*?)(?=\n|$)',
-            r'(\d+(?:\.\d+)*)\s+(.*?)(?=\n|$)',
-            r'(?:\n|\A)([A-Z][A-Z\s]+)(?:\n|:)'
+            r'^(\d+(?:\.\d+)*)\s+(.*?)$',
+            r'^([A-Z][A-Z\s]{2,20})$',
+            r'^(Abstract|Introduction|Methodology|Methods|Results|Discussion|Conclusion|References)$',
+            r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*):?\s*$'
         ]
 
-    def extract_images_from_pdf(self, file_path: str) -> List[ImageData]:
-        """Extract images from PDF and perform OCR if enabled."""
+    def extract_images_from_pdf(self, file_path: str) -> List[EnhancedImageData]:
+        """Extract and analyze images with enhanced semantic processing."""
         images = []
         
         try:
-            # Convert PDF pages to images
-            pdf_images = convert_from_path(file_path, dpi=300)
+            # Read PDF content first to get context
+            pdf_text = self._extract_raw_text(file_path)
+            pdf_images = convert_from_path(file_path, dpi=200)
             
             for page_num, page_image in enumerate(pdf_images, 1):
-                # Convert PIL Image to OpenCV format for processing
-                opencv_image = cv2.cvtColor(np.array(page_image), cv2.COLOR_RGB2BGR)
+                # Get page text for context
+                page_context = self._get_page_context(pdf_text, page_num)
                 
-                # Detect regions with significant content (potential embedded images/figures)
-                gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-                
-                # Apply edge detection to find image boundaries
-                edges = cv2.Canny(gray, 50, 150)
-                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                # Filter contours by area to find significant image regions
-                min_area = 10000  # Adjust based on your needs
-                for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area > min_area:
-                        x, y, w, h = cv2.boundingRect(contour)
-                        
-                        # Extract the region
-                        roi = page_image.crop((x, y, x + w, y + h))
-                        
-                        # Perform OCR if enabled
-                        ocr_text = ""
-                        if self.enable_ocr:
-                            try:
-                                ocr_text = pytesseract.image_to_string(roi)
-                            except Exception as e:
-                                logger.warning(f"OCR failed for image on page {page_num}: {str(e)}")
-                        
-                        # Convert to base64 for display
-                        buffered = BytesIO()
-                        roi.save(buffered, format="PNG")
-                        img_base64 = base64.b64encode(buffered.getvalue()).decode()
-                        
-                        image_data = ImageData(
-                            image=roi,
-                            page_number=page_num,
-                            bbox=(x, y, x + w, y + h),
-                            ocr_text=ocr_text,
-                            base64_string=img_base64
-                        )
-                        images.append(image_data)
-                
-                # Also store the full page as an image for reference
-                buffered = BytesIO()
-                page_image.save(buffered, format="PNG")
-                full_page_base64 = base64.b64encode(buffered.getvalue()).decode()
-                
-                # Perform OCR on full page if no specific regions were found
-                if not any(img.page_number == page_num for img in images):
-                    ocr_text = ""
-                    if self.enable_ocr:
-                        try:
-                            ocr_text = pytesseract.image_to_string(page_image)
-                        except Exception as e:
-                            logger.warning(f"OCR failed for page {page_num}: {str(e)}")
-                    
-                    full_page_data = ImageData(
-                        image=page_image,
-                        page_number=page_num,
-                        ocr_text=ocr_text,
-                        base64_string=full_page_base64
-                    )
-                    images.append(full_page_data)
+                # Process images on this page
+                page_images = self._extract_page_images(page_image, page_num, page_context)
+                images.extend(page_images)
                     
         except Exception as e:
             logger.error(f"Error extracting images from PDF: {str(e)}")
             
         return images
 
-    def extract_text_from_pdf(self, file_path: str) -> PDFDocument:
-        """Extract text from PDF with enhanced page-level tracking and image extraction."""
-        doc = PDFDocument(filename=os.path.basename(file_path))
-        full_text = ""
-        char_to_page = []
+    def _extract_raw_text(self, file_path: str) -> Dict[int, str]:
+        """Extract raw text by page."""
+        pages_text = {}
+        try:
+            with open(file_path, "rb") as file:
+                pdf = pypdf.PdfReader(file)
+                for i, page in enumerate(pdf.pages):
+                    pages_text[i + 1] = page.extract_text() or ""
+        except Exception as e:
+            logger.error(f"Error extracting raw text: {e}")
+        return pages_text
 
+    def _get_page_context(self, pdf_text: Dict[int, str], page_num: int) -> str:
+        """Get text context around a page."""
+        context_pages = []
+        
+        # Include current page and adjacent pages for context
+        for p in range(max(1, page_num - 1), min(len(pdf_text) + 1, page_num + 2)):
+            if p in pdf_text:
+                context_pages.append(pdf_text[p][:500])  # First 500 chars of each page
+        
+        return " ".join(context_pages)
+
+    def _extract_page_images(self, page_image: Image.Image, page_num: int, 
+                           page_context: str) -> List[EnhancedImageData]:
+        """Extract images from a single page with context."""
+        images = []
+        
+        try:
+            opencv_image = cv2.cvtColor(np.array(page_image), cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+            
+            # Enhanced edge detection
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 30, 80)
+            
+            # Morphological operations to connect nearby edges
+            kernel = np.ones((3, 3), np.uint8)
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+            
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filter and sort contours by area
+            min_area = 5000
+            valid_contours = [(cv2.contourArea(c), c) for c in contours if cv2.contourArea(c) > min_area]
+            valid_contours.sort(reverse=True)  # Largest first
+            
+            processed_count = 0
+            for area, contour in valid_contours[:3]:  # Top 3 largest regions
+                try:
+                    image_data = self._process_image_region(
+                        page_image, contour, page_num, page_context, processed_count
+                    )
+                    if image_data and image_data.confidence > 0.4:  # Only high-confidence images
+                        images.append(image_data)
+                        processed_count += 1
+                except Exception as e:
+                    logger.warning(f"Error processing image region: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error extracting page images: {e}")
+            
+        return images
+
+    def _process_image_region(self, page_image: Image.Image, contour, 
+                            page_num: int, page_context: str, 
+                            region_idx: int) -> Optional[EnhancedImageData]:
+        """Process a single image region."""
+        try:
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # Filter out very thin regions (likely text lines)
+            aspect_ratio = w / h
+            if aspect_ratio > 10 or aspect_ratio < 0.1:
+                return None
+                
+            roi = page_image.crop((x, y, x + w, y + h))
+            
+            # Enhanced OCR with better configuration
+            ocr_text = ""
+            try:
+                # Try different PSM modes for better results
+                for psm in [6, 8, 3]:
+                    try:
+                        ocr_result = pytesseract.image_to_string(
+                            roi, 
+                            config=f'--psm {psm} -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,%()-+/: '
+                        )
+                        if len(ocr_result.strip()) > len(ocr_text.strip()):
+                            ocr_text = ocr_result
+                    except:
+                        continue
+                        
+            except Exception as e:
+                logger.warning(f"OCR failed for region {region_idx}: {e}")
+            
+            # Enhanced image analysis
+            image_type, analysis, confidence = self._analyze_image_enhanced(roi, ocr_text, page_context)
+            
+            if confidence < 0.4:  # Skip low-confidence detections
+                return None
+            
+            # Extract semantic keywords
+            keywords = self.image_matcher.extract_keywords(f"{ocr_text} {analysis}")
+            
+            # Convert to base64
+            buffered = BytesIO()
+            roi.save(buffered, format="PNG", quality=85)
+            img_base64 = base64.b64encode(buffered.getvalue()).decode()
+            
+            return EnhancedImageData(
+                image=roi,
+                page_number=page_num,
+                bbox=(x, y, x + w, y + h),
+                ocr_text=ocr_text.strip(),
+                base64_string=img_base64,
+                image_type=image_type,
+                analysis=analysis,
+                confidence=confidence,
+                semantic_keywords=keywords,
+                context_text=page_context[:200]  # First 200 chars of page context
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing image region: {e}")
+            return None
+
+    def _analyze_image_enhanced(self, image: Image.Image, ocr_text: str, 
+                              context: str) -> Tuple[str, str, float]:
+        """Enhanced image analysis with context."""
+        try:
+            img_array = np.array(image)
+            height, width = img_array.shape[:2]
+            
+            # Calculate image statistics
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
+            
+            # Detect lines (for tables/charts)
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
+            
+            horizontal_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, horizontal_kernel)
+            vertical_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, vertical_kernel)
+            
+            h_line_count = np.sum(horizontal_lines > 0)
+            v_line_count = np.sum(vertical_lines > 0)
+            
+            # Analyze text characteristics
+            text_lower = ocr_text.lower()
+            context_lower = context.lower()
+            
+            # Enhanced type detection
+            confidence = 0.3  # Base confidence
+            image_type = "figure"
+            analysis = ""
+            
+            # Table detection
+            if (h_line_count > 100 and v_line_count > 100) or \
+               any(word in text_lower for word in ['table', 'row', 'column', '|']):
+                image_type = "table"
+                confidence = 0.8
+                analysis = f"Table with structured data containing {len(ocr_text.split())} text elements."
+                if ocr_text:
+                    # Count potential rows/columns
+                    rows = len([line for line in ocr_text.split('\n') if line.strip()])
+                    analysis += f" Estimated {rows} rows of data."
+            
+            # Chart/Graph detection
+            elif any(word in text_lower for word in ['%', 'chart', 'graph', 'axis', 'plot']) or \
+                 len(re.findall(r'\d+\.?\d*%', text_lower)) > 2:
+                image_type = "chart"
+                confidence = 0.9
+                percentages = re.findall(r'\d+\.?\d*%', text_lower)
+                numbers = re.findall(r'\d+\.?\d*', text_lower)
+                analysis = f"Chart/Graph with {len(numbers)} numeric values"
+                if percentages:
+                    analysis += f" including {len(percentages)} percentages"
+                analysis += f". Key data: {', '.join(percentages[:3])}" if percentages else ""
+            
+            # Diagram/Flow detection
+            elif any(word in text_lower for word in ['flow', 'process', 'step', 'arrow', 'diagram']) or \
+                 any(word in context_lower for word in ['process', 'workflow', 'procedure']):
+                image_type = "diagram"
+                confidence = 0.7
+                analysis = f"Process diagram or flowchart showing workflow steps."
+                if ocr_text:
+                    steps = len([word for word in text_lower.split() if word in ['step', '1', '2', '3', '4', '5']])
+                    if steps > 0:
+                        analysis += f" Contains approximately {steps} process steps."
+            
+            # Figure detection with context
+            else:
+                confidence = 0.5
+                analysis = f"Figure or illustration"
+                if ocr_text:
+                    analysis += f" with descriptive text: '{ocr_text[:100]}...'" if len(ocr_text) > 100 else f" with text: '{ocr_text}'"
+                else:
+                    analysis += " (visual content without readable text)"
+            
+            # Boost confidence based on context relevance
+            if any(word in context_lower for word in [image_type, 'figure', 'table', 'chart']):
+                confidence = min(confidence + 0.2, 1.0)
+            
+            # Add dimensional and quality info
+            analysis += f" [Size: {width}x{height}px, Quality: {'High' if min(width, height) > 150 else 'Medium'}]"
+            
+            return image_type, analysis, confidence
+            
+        except Exception as e:
+            logger.error(f"Enhanced image analysis failed: {e}")
+            return "figure", f"Image analysis error: {str(e)}", 0.2
+
+    def extract_text_from_pdf(self, file_path: str) -> PDFDocument:
+        """Extract text with enhanced processing."""
+        doc = PDFDocument(filename=os.path.basename(file_path))
+        
         try:
             # Extract images first
             doc.images = self.extract_images_from_pdf(file_path)
             
-            # Create image to page mapping
+            # Build page-to-images mapping
             for idx, img in enumerate(doc.images):
-                doc.image_to_page_map[idx] = img.page_number
+                page = img.page_number
+                if page not in doc.page_to_images:
+                    doc.page_to_images[page] = []
+                doc.page_to_images[page].append(idx)
+            
+            # Extract text
+            full_text = ""
+            char_to_page = []
             
             with open(file_path, "rb") as file:
                 pdf = pypdf.PdfReader(file)
-
-                if len(pdf.pages) == 0:
-                    logger.warning(f"PDF {file_path} has no pages.")
-                    doc.content = ""
-                    doc.char_to_page_map = []
-                    return doc
-
+                
                 for i, page in enumerate(pdf.pages):
                     page_num = i + 1
                     page_text = page.extract_text() or ""
-
-                    # Clean the text
                     page_text = self._clean_pdf_text(page_text)
                     
-                    # Add OCR text from images on this page
-                    ocr_texts = [img.ocr_text for img in doc.images if img.page_number == page_num]
-                    if ocr_texts:
-                        page_text += "\n\n[OCR Extracted Text]:\n" + "\n".join(ocr_texts)
-
+                    # Add high-quality OCR text from images
+                    if page_num in doc.page_to_images:
+                        image_texts = []
+                        for img_idx in doc.page_to_images[page_num]:
+                            img = doc.images[img_idx]
+                            if img.ocr_text and img.confidence > 0.6:
+                                image_texts.append(f"[{img.image_type.title()}]: {img.ocr_text}")
+                        
+                        if image_texts:
+                            page_text += f"\n\n=== Visual Content on Page {page_num} ===\n" + "\n".join(image_texts)
+                    
                     if page_text.strip():
                         doc.pages[page_num] = page_text
-                        full_text += page_text
-                        char_to_page.extend([page_num] * len(page_text))
-
+                        full_text += page_text + "\n\n"
+                        char_to_page.extend([page_num] * len(page_text + "\n\n"))
+            
             doc.content = full_text
             doc.char_to_page_map = char_to_page
+            
             return doc
-
+            
         except Exception as e:
-            logger.error(f"Error extracting text from PDF {file_path}: {str(e)}")
+            logger.error(f"Error extracting text from PDF: {e}")
             raise
 
     def _clean_pdf_text(self, text: str) -> str:
-        """Clean extracted PDF text to improve quality."""
+        """Enhanced text cleaning."""
+        # Remove excessive whitespace
         text = re.sub(r'\s+', ' ', text)
         text = re.sub(r'\s*\n\s*', '\n', text)
         text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Fix hyphenated words
+        text = re.sub(r'([a-z])-\s*\n\s*([a-z])', r'\1\2', text)
         text = re.sub(r'([a-z])- ?([a-z])', r'\1\2', text)
-        return text
+        
+        # Fix common OCR errors
+        text = re.sub(r'\b(\w)\s+(\w)\b', r'\1\2', text)  # Fix spaced letters
+        text = re.sub(r'(\w)\s*\.\s*(\w)', r'\1.\2', text)  # Fix spaced periods
+        
+        return text.strip()
 
-    def _extract_section_info(self, text: str) -> Dict[str, str]:
-        """Extract section headings and numbers from text."""
+    def chunk_document_enhanced(self, doc: PDFDocument) -> PDFDocument:
+        """Enhanced chunking with better context preservation."""
+        if not doc.content:
+            return doc
+        
+        try:
+            # Create overlapping chunks with context
+            raw_chunks = self.text_splitter.create_documents([doc.content])
+            
+            for i, chunk in enumerate(raw_chunks):
+                chunk_text = chunk.page_content
+                start_pos = doc.content.find(chunk_text)
+                
+                if start_pos == -1:
+                    # Fallback for exact match failure
+                    # Try to find approximate position
+                    words = chunk_text.split()[:5]
+                    search_text = " ".join(words)
+                    start_pos = doc.content.find(search_text)
+                    if start_pos == -1:
+                        start_pos = i * (self.chunk_size - self.chunk_overlap)
+                
+                end_pos = start_pos + len(chunk_text) - 1
+                
+                # Get context before and after
+                context_before = ""
+                context_after = ""
+                
+                if start_pos > self.context_window:
+                    context_start = start_pos - self.context_window
+                    context_before = doc.content[context_start:start_pos].strip()
+                
+                if end_pos + self.context_window < len(doc.content):
+                    context_end = end_pos + self.context_window
+                    context_after = doc.content[end_pos:context_end].strip()
+                
+                # Find pages this chunk spans
+                chunk_pages = set()
+                for pos in range(max(0, start_pos), min(end_pos + 1, len(doc.char_to_page_map))):
+                    if pos < len(doc.char_to_page_map):
+                        chunk_pages.add(doc.char_to_page_map[pos])
+                
+                if not chunk_pages:
+                    chunk_pages = {1}
+                
+                # Enhanced image matching
+                relevant_images = self._find_relevant_images(
+                    chunk_text, list(chunk_pages), doc.images, doc.page_to_images
+                )
+                
+                # Extract section information
+                section_info = self._extract_section_info_enhanced(chunk_text)
+                
+                enhanced_chunk = EnhancedChunk(
+                    text=chunk_text,
+                    page_numbers=sorted(list(chunk_pages)),
+                    start_char_idx=start_pos,
+                    end_char_idx=end_pos,
+                    filename=doc.filename,
+                    section_info=section_info,
+                    image_refs=relevant_images,
+                    context_before=context_before,
+                    context_after=context_after
+                )
+                
+                doc.chunks.append(enhanced_chunk)
+            
+            logger.info(f"Created {len(doc.chunks)} enhanced chunks")
+            return doc
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced chunking: {e}")
+            return doc
+
+    def _find_relevant_images(self, chunk_text: str, chunk_pages: List[int], 
+                            images: List[EnhancedImageData], 
+                            page_to_images: Dict[int, List[int]]) -> List[int]:
+        """Find images relevant to a chunk using semantic matching."""
+        relevant_images = []
+        
+        try:
+            # Get candidate images from chunk pages and adjacent pages
+            candidate_images = []
+            for page in chunk_pages:
+                # Current page
+                if page in page_to_images:
+                    candidate_images.extend(page_to_images[page])
+                # Adjacent pages
+                for adj_page in [page - 1, page + 1]:
+                    if adj_page in page_to_images:
+                        candidate_images.extend(page_to_images[adj_page])
+            
+            # Remove duplicates
+            candidate_images = list(set(candidate_images))
+            
+            # Score each candidate image
+            image_scores = []
+            for img_idx in candidate_images:
+                if img_idx < len(images):
+                    img = images[img_idx]
+                    
+                    # Calculate relevance score
+                    relevance_score = self.image_matcher.calculate_image_relevance(chunk_text, img)
+                    
+                    # Additional scoring factors
+                    page_proximity = 1.0 if img.page_number in chunk_pages else 0.5
+                    confidence_factor = img.confidence
+                    
+                    final_score = relevance_score * page_proximity * confidence_factor
+                    
+                    if final_score > 0.3:  # Threshold for relevance
+                        image_scores.append((img_idx, final_score))
+            
+            # Sort by score and take top relevant images
+            image_scores.sort(key=lambda x: x[1], reverse=True)
+            relevant_images = [img_idx for img_idx, score in image_scores[:2]]  # Max 2 images per chunk
+            
+        except Exception as e:
+            logger.error(f"Error finding relevant images: {e}")
+        
+        return relevant_images
+
+    def _extract_section_info_enhanced(self, text: str) -> Dict[str, str]:
+        """Enhanced section extraction."""
         section_info = {}
-
+        
+        lines = text.split('\n')
         for pattern in self.section_patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                if len(match.groups()) >= 2:
-                    section_number = match.group(1)
-                    section_title = match.group(2).strip()
-                    section_info[section_number] = section_title
-                elif len(match.groups()) == 1:
-                    section_title = match.group(1).strip()
-                    section_info[f"heading_{len(section_info)}"] = section_title
-
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                match = re.match(pattern, line, re.IGNORECASE)
+                if match:
+                    groups = match.groups()
+                    if len(groups) >= 2:
+                        section_num = groups[0].strip()
+                        section_title = groups[1].strip()
+                        section_info[section_num] = section_title
+                    elif len(groups) == 1:
+                        section_title = groups[0].strip()
+                        if len(section_title) > 3:  # Avoid single words
+                            section_info[f"section_{len(section_info)}"] = section_title
+        
         return section_info
 
-    def chunk_document(self, doc: PDFDocument) -> PDFDocument:
-        """Chunk document with page tracking and image references."""
-        if not doc.content or not doc.char_to_page_map:
-            if not doc.content:
-                logger.warning(f"Document {doc.filename} has no content to chunk.")
-            if not doc.char_to_page_map:
-                logger.warning(f"Document {doc.filename} has no page mapping available.")
-            return doc
-
-        try:
-            raw_chunks = self.text_splitter.create_documents([doc.content])
-        except Exception as e:
-            logger.error(f"Error creating chunks: {str(e)}")
-            return doc
-
-        for i, chunk in enumerate(raw_chunks):
-            chunk_text = chunk.page_content
-
-            # Find position in the original text
-            start_pos = doc.content.find(chunk_text)
-            if start_pos == -1:
-                logger.warning(f"Could not find exact chunk position for chunk {i}.")
-                start_pos = 0
-                end_pos = min(len(chunk_text), len(doc.content)) - 1
-            else:
-                end_pos = start_pos + len(chunk_text) - 1
-
-            # Find the page numbers this chunk spans
-            chunk_pages = set()
-            for pos in range(start_pos, min(end_pos + 1, len(doc.char_to_page_map))):
-                if pos < len(doc.char_to_page_map):
-                    chunk_pages.add(doc.char_to_page_map[pos])
-
-            if not chunk_pages:
-                chunk_pages = {1}
-                logger.warning(f"No pages found for chunk {i} in document {doc.filename}.")
-
-            # Find related images
-            image_refs = []
-            for idx, img in enumerate(doc.images):
-                if img.page_number in chunk_pages:
-                    # Check if the image's OCR text is mentioned in the chunk
-                    if img.ocr_text and any(text_part in chunk_text for text_part in img.ocr_text.split()[:5]):
-                        image_refs.append(idx)
-                    # Or if chunk mentions "figure", "image", "diagram" near this page
-                    elif any(keyword in chunk_text.lower() for keyword in ["figure", "image", "diagram", "chart", "graph"]):
-                        image_refs.append(idx)
-
-            # Extract section information
-            section_info = self._extract_section_info(chunk_text)
-
-            # Create PageChunk
-            page_chunk = PageChunk(
-                text=chunk_text,
-                page_numbers=sorted(list(chunk_pages)),
-                start_char_idx=start_pos,
-                end_char_idx=end_pos,
-                filename=doc.filename,
-                section_info=section_info,
-                image_refs=image_refs
-            )
-
-            doc.chunks.append(page_chunk)
-
-        return doc
-
     def process_pdf(self, file_path: str) -> PDFDocument:
-        """Process PDF file in a single call."""
+        """Process PDF with all enhancements."""
         doc = self.extract_text_from_pdf(file_path)
-        return self.chunk_document(doc)
+        return self.chunk_document_enhanced(doc)
 
 class VertexAIEmbeddings(Embeddings):
-    """Custom embeddings class using VertexGenAI that properly inherits from LangChain's Embeddings base class."""
+    """VertexAI embeddings optimized for accuracy."""
     
     def __init__(self, vertex_gen_ai: VertexGenAI, model_name: str = "text-embedding-004"):
         self.vertex_gen_ai = vertex_gen_ai
@@ -399,986 +746,1054 @@ class VertexAIEmbeddings(Embeddings):
         super().__init__()
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Embed multiple documents."""
+        """Embed documents with preprocessing."""
         if not texts:
             return []
-            
+        
         try:
-            logger.info(f"Embedding {len(texts)} documents with VertexAI")
+            # Preprocess texts for better embeddings
+            processed_texts = [self._preprocess_text(text) for text in texts]
             
-            # Get embeddings from VertexGenAI
-            embeddings_response = self.vertex_gen_ai.get_embeddings(texts, self.model_name)
+            logger.info(f"Embedding {len(processed_texts)} documents")
+            embeddings_response = self.vertex_gen_ai.get_embeddings(processed_texts, self.model_name)
             
-            # Extract vectors from response
             embeddings = []
             for embedding in embeddings_response:
                 if hasattr(embedding, 'values'):
-                    embeddings.append(list(embedding.values))
+                    vector = np.array(embedding.values, dtype=np.float32)
+                    # L2 normalize for cosine similarity
+                    vector = vector / (np.linalg.norm(vector) + 1e-12)
+                    embeddings.append(vector.tolist())
                 else:
-                    # Log warning and use zero vector as fallback
-                    logger.warning(f"Embedding response missing 'values' attribute")
                     embeddings.append(self._get_zero_vector())
             
-            # Set embedding dimension if not already set
             if embeddings and self._embedding_dimension is None:
                 self._embedding_dimension = len(embeddings[0])
                 logger.info(f"Set embedding dimension to {self._embedding_dimension}")
-                
+            
             return embeddings
             
         except Exception as e:
             logger.error(f"Error getting embeddings: {str(e)}")
-            # Return zero vectors for all texts
             return [self._get_zero_vector() for _ in texts]
     
     def embed_query(self, text: str) -> List[float]:
-        """Embed a single query."""
+        """Embed query with preprocessing."""
         if not text:
             return self._get_zero_vector()
-            
+        
         try:
-            logger.info(f"Embedding query with VertexAI: {text[:50]}...")
-            
-            # Get embedding for single text
-            embeddings_response = self.vertex_gen_ai.get_embeddings([text], self.model_name)
+            processed_text = self._preprocess_text(text)
+            embeddings_response = self.vertex_gen_ai.get_embeddings([processed_text], self.model_name)
             
             if embeddings_response and len(embeddings_response) > 0:
                 embedding = embeddings_response[0]
                 if hasattr(embedding, 'values'):
-                    vector = list(embedding.values)
-                    # Update dimension if needed
+                    vector = np.array(embedding.values, dtype=np.float32)
+                    vector = vector / (np.linalg.norm(vector) + 1e-12)
+                    
                     if self._embedding_dimension is None:
                         self._embedding_dimension = len(vector)
-                        logger.info(f"Set embedding dimension to {self._embedding_dimension}")
-                    return vector
-                    
+                    return vector.tolist()
+            
             return self._get_zero_vector()
             
         except Exception as e:
             logger.error(f"Error getting query embedding: {str(e)}")
             return self._get_zero_vector()
     
+    def _preprocess_text(self, text: str) -> str:
+        """Preprocess text for better embeddings."""
+        # Clean and normalize text
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        
+        # Truncate if too long (most embedding models have limits)
+        if len(text) > 8000:  # Conservative limit
+            text = text[:8000] + "..."
+        
+        return text
+    
     def _get_zero_vector(self) -> List[float]:
-        """Get a zero vector of appropriate dimension."""
-        # Use stored dimension or default to 768 (common embedding size)
+        """Get normalized zero vector."""
         dim = self._embedding_dimension if self._embedding_dimension else 768
         return [0.0] * dim
 
     async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Async version - just calls sync version for now."""
         return self.embed_documents(texts)
     
     async def aembed_query(self, text: str) -> List[float]:
-        """Async version - just calls sync version for now."""
         return self.embed_query(text)
 
 class HybridRetriever:
-    """Hybrid retrieval system with VertexAI embeddings."""
-
-    def __init__(self, documents: List[Document] = None, use_mmr: bool = True,
-                 faiss_index_path: str = None, vertex_gen_ai: VertexGenAI = None):
-        """Initialize retriever with documents or existing FAISS index."""
-        
-        logger.info("Initializing HybridRetriever...")
-        
-        try:
-            if vertex_gen_ai:
-                logger.info("Using VertexAI embeddings")
-                self.embeddings = VertexAIEmbeddings(vertex_gen_ai)
-            else:
-                logger.info("Falling back to SentenceTransformer embeddings")
-                self.embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-
-            # Initialize vector store
-            if faiss_index_path and os.path.exists(faiss_index_path):
-                logger.info(f"Loading existing FAISS index from {faiss_index_path}")
-                self.vector_store = FAISS.load_local(
-                    faiss_index_path, 
-                    self.embeddings, 
-                    allow_dangerous_deserialization=True
-                )
-                logger.info("Successfully loaded existing FAISS index")
-            elif documents and len(documents) > 0:
-                logger.info(f"Creating new FAISS index from {len(documents)} documents")
-                self.vector_store = FAISS.from_documents(documents, self.embeddings)
-                logger.info("Successfully created new FAISS index")
-            else:
-                logger.info("Creating empty FAISS index with placeholder")
-                self.vector_store = FAISS.from_texts(["placeholder"], self.embeddings)
-                logger.info("Created empty FAISS index")
-
-            # Configure retriever
-            search_kwargs = {"k": 6, "fetch_k": 10} if use_mmr else {"k": 5}
-            self.retriever = self.vector_store.as_retriever(
-                search_type="mmr" if use_mmr else "similarity",
-                search_kwargs=search_kwargs
-            )
-            logger.info(f"Configured retriever with search_type={'mmr' if use_mmr else 'similarity'}")
-            
-        except Exception as e:
-            logger.error(f"Error initializing HybridRetriever: {str(e)}")
-            raise
-
-    def get_relevant_documents(self, query: str, top_k: int = 5) -> List[Document]:
-        """Get relevant documents using hybrid search."""
-        try:
-            logger.info(f"Retrieving documents for query: {query[:50]}...")
-            docs = self.retriever.get_relevant_documents(query)
-            logger.info(f"Retrieved {len(docs)} documents")
-            return docs
-        except Exception as e:
-            logger.error(f"Error in get_relevant_documents: {str(e)}")
-            return []
-
-    def update_documents(self, documents: List[Document]):
-        """Update the document store with new documents."""
-        try:
-            logger.info(f"Adding {len(documents)} new documents to vector store")
-            self.vector_store.add_documents(documents)
-            logger.info("Successfully added documents to vector store")
-        except Exception as e:
-            logger.error(f"Error updating documents: {str(e)}")
-            raise
-
-    def save_index(self, path: str):
-        """Save the FAISS index to disk."""
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            self.vector_store.save_local(path)
-            logger.info(f"Saved FAISS index to {path}")
-            return f"Saved FAISS index to {path}"
-        except Exception as e:
-            logger.error(f"Error saving index: {str(e)}")
-            raise
-
-class AdvancedRAGSystem:
-    """Enhanced RAG system with VertexAI integration and image support."""
-
-    def __init__(self,
-                 vertex_gen_ai: VertexGenAI = None,
-                 faiss_index_path: str = None,
-                 enable_ocr: bool = True):
-
-        logger.info("Initializing AdvancedRAGSystem...")
+    """Hybrid retriever combining dense (HNSW) and sparse (BM25) retrieval with reranking."""
+    
+    def __init__(self, documents: List[Document] = None, vertex_gen_ai: VertexGenAI = None):
+        logger.info("Initializing HybridRetriever with reranking...")
         
         self.vertex_gen_ai = vertex_gen_ai
-        self.enable_ocr = enable_ocr
-
-        self.processor = EnhancedPDFProcessor(
-            chunk_size=800,
-            chunk_overlap=200,
-            enable_ocr=enable_ocr
-        )
-        self.documents = {}  # Store processed documents
-        self.retrievers = {}  # Store retrievers by document
-
-        # Initialize hybrid retriever
-        self.hybrid_retriever = None
-        self.faiss_index_path = faiss_index_path
-
-        # If we have a FAISS path, initialize the retriever
-        if faiss_index_path and os.path.exists(faiss_index_path):
-            try:
-                self.hybrid_retriever = HybridRetriever(
-                    faiss_index_path=faiss_index_path,
-                    vertex_gen_ai=vertex_gen_ai
-                )
-                logger.info("Initialized retriever with existing FAISS index")
-            except Exception as e:
-                logger.error(f"Error loading existing FAISS index: {str(e)}")
-
-        self.conversation_history = []
-        self.conversation_chain = None
-
-        # Initialize conversation chain if we have VertexGenAI
-        if vertex_gen_ai:
-            logger.info("VertexGenAI provided, system ready for initialization")
-        else:
-            logger.warning("No VertexGenAI instance provided")
-
-    def upload_pdf(self, file_path: str) -> str:
-        """Process and index a PDF document with image extraction."""
+        self.embeddings = VertexAIEmbeddings(vertex_gen_ai) if vertex_gen_ai else None
+        
+        # Storage
+        self.documents = []
+        self.document_embeddings = []
+        
+        # Dense retrieval (HNSW)
+        self.hnsw_index = None
+        self.dimension = None
+        
+        # Sparse retrieval (BM25)
+        self.bm25 = None
+        self.tokenized_docs = []
+        
+        # Reranking
+        self.reranker = None
+        self._init_reranker()
+        
+        if documents and len(documents) > 0:
+            self.add_documents(documents)
+    
+    def _init_reranker(self):
+        """Initialize cross-encoder for reranking."""
         try:
-            logger.info(f"Processing PDF: {file_path}")
-            
-            # Process the document
-            doc = self.processor.process_pdf(file_path)
-
-            # Store the document
-            self.documents[doc.filename] = doc
-
-            # Update the retrievers
-            self._update_retrievers()
-
-            image_count = len(doc.images)
-            result = f"Processed and indexed {doc.filename} ({len(doc.pages)} pages, {len(doc.chunks)} chunks, {image_count} images extracted)"
-            logger.info(result)
-            return result
+            # Use a lightweight cross-encoder
+            self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+            logger.info("Initialized cross-encoder reranker")
         except Exception as e:
-            error_msg = f"Error uploading PDF: {str(e)}"
-            logger.error(error_msg)
-            raise Exception(error_msg)
-
-    def _update_retrievers(self):
-        """Update the retriever system with current documents."""
+            logger.warning(f"Could not initialize reranker: {e}")
+            self.reranker = None
+    
+    def add_documents(self, documents: List[Document]):
+        """Add documents to both dense and sparse indices."""
         try:
-            logger.info("Updating retrievers with current documents...")
+            logger.info(f"Adding {len(documents)} documents to hybrid index")
             
-            all_docs = []
-            for doc in self.documents.values():
-                all_docs.extend(doc.langchain_documents)
-
-            if not all_docs:
-                logger.warning("No documents to update retrievers with")
-                return
-
-            logger.info(f"Total documents to index: {len(all_docs)}")
-
-            if not self.hybrid_retriever:
-                logger.info("Creating new HybridRetriever")
-                self.hybrid_retriever = HybridRetriever(
-                    all_docs,
-                    vertex_gen_ai=self.vertex_gen_ai
-                )
-            else:
-                logger.info("Updating existing HybridRetriever")
-                self.hybrid_retriever.update_documents(all_docs)
-
-            # Initialize conversation chain
-            self._initialize_conversation_chain()
+            # Extract texts
+            texts = [doc.page_content for doc in documents]
+            
+            # Dense embeddings
+            embeddings = self.embeddings.embed_documents(texts)
+            
+            if embeddings:
+                # Initialize HNSW if needed
+                if self.hnsw_index is None:
+                    self.dimension = len(embeddings[0])
+                    self.hnsw_index = hnswlib.Index(space='cosine', dim=self.dimension)
+                    self.hnsw_index.init_index(max_elements=50000, ef_construction=400, M=32)
+                    logger.info(f"Initialized HNSW with dimension {self.dimension}")
+                
+                # Add to HNSW
+                start_idx = len(self.documents)
+                ids = list(range(start_idx, start_idx + len(documents)))
+                embeddings_array = np.array(embeddings, dtype=np.float32)
+                self.hnsw_index.add_items(embeddings_array, ids)
+                self.hnsw_index.set_ef(100)  # Higher ef for better recall
+            
+            # Sparse indexing (BM25)
+            new_tokenized = [self._tokenize_text(text) for text in texts]
+            self.tokenized_docs.extend(new_tokenized)
+            
+            # Rebuild BM25 index
+            if self.tokenized_docs:
+                self.bm25 = BM25Okapi(self.tokenized_docs)
+            
+            # Store documents and embeddings
+            self.documents.extend(documents)
+            self.document_embeddings.extend(embeddings)
+            
+            logger.info(f"Successfully added {len(documents)} documents to hybrid index")
             
         except Exception as e:
-            logger.error(f"Error updating retrievers: {str(e)}")
+            logger.error(f"Error adding documents to hybrid index: {str(e)}")
             raise
-
-    def _create_custom_chain(self, retriever):
-        """Create a custom chain that handles our specific prompt format."""
+    
+    def _tokenize_text(self, text: str) -> List[str]:
+        """Tokenize text for BM25."""
+        # Simple tokenization - could be enhanced
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', ' ', text)
+        tokens = text.split()
+        # Remove very short tokens
+        tokens = [token for token in tokens if len(token) > 2]
+        return tokens
+    
+    def get_relevant_documents(self, query: str, k: int = 5) -> List[Document]:
+        """Retrieve documents using hybrid approach with reranking."""
+        try:
+            if not self.documents:
+                return []
+            
+            logger.info(f"Hybrid retrieval for query: {query[:50]}...")
+            
+            # Step 1: Dense retrieval (HNSW)
+            dense_results = self._dense_retrieval(query, k * 3)  # Get more candidates
+            
+            # Step 2: Sparse retrieval (BM25)
+            sparse_results = self._sparse_retrieval(query, k * 3)
+            
+            # Step 3: Combine and deduplicate
+            combined_results = self._combine_results(dense_results, sparse_results)
+            
+            # Step 4: Rerank if available
+            if self.reranker and len(combined_results) > k:
+                reranked_results = self._rerank_results(query, combined_results, k * 2)
+            else:
+                reranked_results = combined_results[:k * 2]
+            
+            # Step 5: Final selection and scoring
+            final_results = self._final_selection(reranked_results, k)
+            
+            logger.info(f"Retrieved {len(final_results)} documents after hybrid processing")
+            return final_results
+            
+        except Exception as e:
+            logger.error(f"Error in hybrid retrieval: {str(e)}")
+            return []
+    
+    def _dense_retrieval(self, query: str, k: int) -> List[Tuple[Document, float]]:
+        """Dense retrieval using HNSW."""
+        results = []
         
-        def format_docs(docs):
-            formatted = []
-            for doc in docs:
-                content = doc.page_content
-                metadata = doc.metadata
-                
-                # Include image references if available
-                image_note = ""
-                if metadata.get('image_refs'):
-                    image_note = f"\nImage References: {metadata['image_refs']}"
+        try:
+            if not self.hnsw_index:
+                return results
+            
+            query_embedding = self.embeddings.embed_query(query)
+            if not query_embedding:
+                return results
+            
+            query_array = np.array([query_embedding], dtype=np.float32)
+            labels, distances = self.hnsw_index.knn_query(query_array, k=min(k, len(self.documents)))
+            
+            for label, distance in zip(labels[0], distances[0]):
+                if label < len(self.documents):
+                    doc = self.documents[label].copy()
+                    similarity = 1 - distance  # Convert distance to similarity
+                    doc.metadata['dense_score'] = similarity
+                    doc.metadata['retrieval_method'] = 'dense'
+                    results.append((doc, similarity))
                     
-                formatted_doc = f"""
-Document: {metadata.get('source', 'Unknown')}
-Pages: {metadata.get('page_numbers', [])}
-Section: {metadata.get('section_info', {})}
-Content: {content}{image_note}
-"""
-                formatted.append(formatted_doc)
-            return "\n\n---\n\n".join(formatted)
+        except Exception as e:
+            logger.error(f"Error in dense retrieval: {e}")
         
-        def custom_chain(inputs):
-            try:
-                logger.info(f"Processing query in custom chain: {inputs.get('question', '')[:50]}...")
-                
-                # Get relevant documents
-                docs = retriever.get_relevant_documents(inputs["question"])
-                
-                # Format context
-                context = format_docs(docs)
-                
-                # Format chat history
-                chat_history = ""
-                for q, a in self.conversation_history[-5:]:  # Last 5 exchanges
-                    chat_history += f"Human: {q}\nAssistant: {a}\n\n"
-                
-                # Create prompt
-                prompt = f"""You are a precise document assistant with perfect knowledge of the provided document information.
-Your goal is to give accurate, thorough answers with exact document and page citations.
+        return results
+    
+    def _sparse_retrieval(self, query: str, k: int) -> List[Tuple[Document, float]]:
+        """Sparse retrieval using BM25."""
+        results = []
+        
+        try:
+            if not self.bm25:
+                return results
+            
+            query_tokens = self._tokenize_text(query)
+            if not query_tokens:
+                return results
+            
+            scores = self.bm25.get_scores(query_tokens)
+            
+            # Get top k results
+            top_indices = np.argsort(scores)[::-1][:k]
+            
+            for idx in top_indices:
+                if idx < len(self.documents) and scores[idx] > 0:
+                    doc = self.documents[idx].copy()
+                    doc.metadata['sparse_score'] = float(scores[idx])
+                    doc.metadata['retrieval_method'] = 'sparse'
+                    results.append((doc, float(scores[idx])))
+                    
+        except Exception as e:
+            logger.error(f"Error in sparse retrieval: {e}")
+        
+        return results
+    
+    def _combine_results(self, dense_results: List[Tuple[Document, float]], 
+                        sparse_results: List[Tuple[Document, float]]) -> List[Tuple[Document, float]]:
+        """Combine and deduplicate dense and sparse results."""
+        seen_hashes = set()
+        combined = []
+        
+        # Normalize scores to [0, 1] range
+        def normalize_scores(results):
+            if not results:
+                return results
+            scores = [score for _, score in results]
+            if max(scores) > min(scores):
+                min_score, max_score = min(scores), max(scores)
+                return [(doc, (score - min_score) / (max_score - min_score)) 
+                       for doc, score in results]
+            return results
+        
+        dense_norm = normalize_scores(dense_results)
+        sparse_norm = normalize_scores(sparse_results)
+        
+        # Combine with weighted scoring
+        all_results = []
+        
+        # Add dense results with weight
+        for doc, score in dense_norm:
+            doc_hash = doc.metadata.get('chunk_hash', hash(doc.page_content))
+            if doc_hash not in seen_hashes:
+                seen_hashes.add(doc_hash)
+                doc.metadata['combined_score'] = 0.7 * score  # Dense weight: 0.7
+                all_results.append((doc, doc.metadata['combined_score']))
+        
+        # Add sparse results with weight
+        for doc, score in sparse_norm:
+            doc_hash = doc.metadata.get('chunk_hash', hash(doc.page_content))
+            if doc_hash not in seen_hashes:
+                seen_hashes.add(doc_hash)
+                doc.metadata['combined_score'] = 0.3 * score  # Sparse weight: 0.3
+                all_results.append((doc, doc.metadata['combined_score']))
+            else:
+                # If document already exists, boost its score
+                for i, (existing_doc, existing_score) in enumerate(all_results):
+                    existing_hash = existing_doc.metadata.get('chunk_hash', hash(existing_doc.page_content))
+                    if existing_hash == doc_hash:
+                        boosted_score = existing_score + 0.3 * score
+                        existing_doc.metadata['combined_score'] = boosted_score
+                        all_results[i] = (existing_doc, boosted_score)
+                        break
+        
+        # Sort by combined score
+        all_results.sort(key=lambda x: x[1], reverse=True)
+        return all_results
+    
+    def _rerank_results(self, query: str, results: List[Tuple[Document, float]], 
+                       top_k: int) -> List[Tuple[Document, float]]:
+        """Rerank results using cross-encoder."""
+        if not self.reranker or len(results) <= 1:
+            return results
+        
+        try:
+            # Prepare query-document pairs
+            query_doc_pairs = []
+            for doc, _ in results:
+                # Use original text for reranking if available
+                text = doc.metadata.get('original_text', doc.page_content)
+                # Truncate long texts
+                if len(text) > 2000:
+                    text = text[:2000] + "..."
+                query_doc_pairs.append([query, text])
+            
+            # Get reranking scores
+            rerank_scores = self.reranker.predict(query_doc_pairs)
+            
+            # Combine with original scores
+            reranked_results = []
+            for i, (doc, original_score) in enumerate(results):
+                rerank_score = float(rerank_scores[i])
+                # Weighted combination: 60% rerank, 40% original
+                final_score = 0.6 * rerank_score + 0.4 * original_score
+                doc.metadata['rerank_score'] = rerank_score
+                doc.metadata['final_score'] = final_score
+                reranked_results.append((doc, final_score))
+            
+            # Sort by final score
+            reranked_results.sort(key=lambda x: x[1], reverse=True)
+            return reranked_results[:top_k]
+            
+        except Exception as e:
+            logger.error(f"Error in reranking: {e}")
+            return results[:top_k]
+    
+    def _final_selection(self, results: List[Tuple[Document, float]], k: int) -> List[Document]:
+        """Final selection with diversity and quality filtering."""
+        if not results:
+            return []
+        
+        selected_docs = []
+        seen_pages = set()
+        
+        for doc, score in results:
+            if len(selected_docs) >= k:
+                break
+            
+            # Quality filter: minimum score threshold
+            if score < 0.1:
+                continue
+            
+            # Diversity filter: avoid too many chunks from same page
+            doc_pages = set(doc.metadata.get('page_numbers', []))
+            page_overlap = len(doc_pages & seen_pages)
+            
+            # Allow if no overlap or score is very high
+            if page_overlap == 0 or score > 0.8:
+                selected_docs.append(doc)
+                seen_pages.update(doc_pages)
+        
+        return selected_docs
 
-IMPORTANT RULES:
-1. Use ONLY the information from the retrieved context below to answer the question
-2. Do NOT use any prior knowledge or information not present in the context
-3. If the answer cannot be found in the context, clearly state: "I cannot find information about this in the provided documents."
-4. Provide exact citations for every piece of information
+class UltraAccurateRAGSystem:
+    """Ultra-accurate RAG system with all enhancements."""
+    
+    def __init__(self, vertex_gen_ai: VertexGenAI = None):
+        logger.info("Initializing UltraAccurateRAGSystem...")
+        
+        self.vertex_gen_ai = vertex_gen_ai
+        self.processor = AdvancedPDFProcessor()
+        self.documents = {}
+        self.hybrid_retriever = None
+        self.conversation_history = []
+        self.reference_counter = 1
+        
+        if vertex_gen_ai:
+            self.hybrid_retriever = HybridRetriever(vertex_gen_ai=vertex_gen_ai)
+    
+    def upload_pdf(self, file_path: str) -> str:
+        """Process and index PDF with all enhancements."""
+        try:
+            logger.info(f"Processing PDF with enhanced accuracy: {file_path}")
+            
+            doc = self.processor.process_pdf(file_path)
+            self.documents[doc.filename] = doc
+            
+            if self.hybrid_retriever:
+                self.hybrid_retriever.add_documents(doc.langchain_documents)
+            
+            # Detailed stats
+            high_conf_images = sum(1 for img in doc.images if img.confidence > 0.6)
+            semantic_chunks = sum(1 for chunk in doc.chunks if chunk.semantic_density > 10)
+            
+            result = f"""✅ **Enhanced Processing Complete: {doc.filename}**
 
-Retrieved Context:
+**Content Analysis:**
+- 📄 Pages: {len(doc.pages)}
+- 🧩 Chunks: {len(doc.chunks)} (with context preservation)
+- 🖼️ Images: {len(doc.images)} ({high_conf_images} high-confidence)
+- 🎯 Semantic chunks: {semantic_chunks}
+
+**Quality Metrics:**
+- Image analysis confidence: {np.mean([img.confidence for img in doc.images]):.2f}
+- Chunk semantic density: {np.mean([chunk.semantic_density for chunk in doc.chunks]):.1f}
+"""
+            
+            logger.info(result.replace('\n', ' '))
+            return result
+            
+        except Exception as e:
+            error_msg = f"❌ **Error processing PDF:** {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+    
+    def ask(self, query: str) -> Dict[str, Any]:
+        """Ultra-accurate query processing with enhanced retrieval."""
+        if not self.hybrid_retriever or not self.documents:
+            return {
+                "answer": "Please upload documents first.",
+                "references": [],
+                "images": []
+            }
+        
+        try:
+            logger.info(f"Processing query with enhanced accuracy: {query[:50]}...")
+            
+            # Enhanced query preprocessing
+            processed_query = self._enhance_query(query)
+            
+            # Hybrid retrieval with reranking
+            relevant_docs = self.hybrid_retriever.get_relevant_documents(processed_query, k=6)
+            
+            if not relevant_docs:
+                return {
+                    "answer": "No relevant information found. Try rephrasing your question or check if the information exists in your documents.",
+                    "references": [],
+                    "images": []
+                }
+            
+            # Enhanced context preparation
+            context_parts = []
+            references = []
+            all_images = []
+            
+            for i, doc in enumerate(relevant_docs):
+                metadata = doc.metadata
+                doc_name = metadata.get('source', 'Unknown')
+                pages = metadata.get('page_numbers', [])
+                
+                # Enhanced scoring
+                final_score = metadata.get('final_score', metadata.get('combined_score', 0.0))
+                dense_score = metadata.get('dense_score', 0.0)
+                sparse_score = metadata.get('sparse_score', 0.0)
+                rerank_score = metadata.get('rerank_score', 0.0)
+                
+                # Create reference with enhanced info
+                ref_id = self.reference_counter
+                reference = {
+                    "id": ref_id,
+                    "document": doc_name,
+                    "pages": pages,
+                    "final_score": final_score,
+                    "dense_score": dense_score,
+                    "sparse_score": sparse_score,
+                    "rerank_score": rerank_score,
+                    "content": metadata.get('original_text', doc.page_content)[:200] + "...",
+                    "type": "text",
+                    "semantic_density": metadata.get('semantic_density', 0.0)
+                }
+                references.append(reference)
+                self.reference_counter += 1
+                
+                # Enhanced context with metadata
+                section_info = metadata.get('section_info', {})
+                section_text = ""
+                if section_info:
+                    sections = [f"{k}: {v}" for k, v in section_info.items()]
+                    section_text = f" [Sections: {', '.join(sections)}]"
+                
+                context_text = f"[{ref_id}] {doc.page_content}{section_text}"
+                context_parts.append(context_text)
+                
+                # Enhanced image retrieval
+                image_refs = metadata.get('image_refs', [])
+                if image_refs and doc_name in self.documents:
+                    pdf_doc = self.documents[doc_name]
+                    for img_idx in image_refs:
+                        if img_idx < len(pdf_doc.images):
+                            img_data = pdf_doc.images[img_idx]
+                            
+                            # Calculate image relevance to query
+                            img_relevance = self.processor.image_matcher.calculate_image_relevance(
+                                processed_query, img_data
+                            )
+                            
+                            if img_relevance > 0.3:  # Only relevant images
+                                all_images.append({
+                                    "document": doc_name,
+                                    "page": img_data.page_number,
+                                    "type": img_data.image_type,
+                                    "analysis": img_data.analysis,
+                                    "confidence": img_data.confidence,
+                                    "base64": img_data.base64_string,
+                                    "reference_id": self.reference_counter,
+                                    "relevance_score": img_relevance,
+                                    "ocr_text": img_data.ocr_text[:150],
+                                    "keywords": img_data.semantic_keywords
+                                })
+                                
+                                # Add image reference
+                                img_ref = {
+                                    "id": self.reference_counter,
+                                    "document": doc_name,
+                                    "pages": [img_data.page_number],
+                                    "final_score": img_relevance,
+                                    "content": f"{img_data.image_type}: {img_data.analysis[:150]}...",
+                                    "type": "image",
+                                    "image_confidence": img_data.confidence
+                                }
+                                references.append(img_ref)
+                                self.reference_counter += 1
+            
+            # Select top 3 most relevant images
+            top_images = sorted(all_images, key=lambda x: x['relevance_score'] * x['confidence'], reverse=True)[:3]
+            
+            # Enhanced context preparation
+            context = self._prepare_enhanced_context(context_parts, top_images)
+            
+            # Create reference links
+            ref_links = {ref["id"]: f"Ref {ref['id']}" for ref in references}
+            
+            # Enhanced prompt with better instructions
+            prompt = self._create_enhanced_prompt(processed_query, context, ref_links)
+            
+            # Generate response
+            response = self.vertex_gen_ai.generate_content(prompt)
+            
+            if not response:
+                response = "I apologize, but I couldn't generate a comprehensive response. Please try rephrasing your question with more specific terms."
+            
+            # Add clickable reference links
+            for ref_id, ref_text in ref_links.items():
+                response = response.replace(f"[{ref_id}]", f"[[{ref_id}]](#ref{ref_id})")
+            
+            self.conversation_history.append((query, response))
+            
+            logger.info(f"Generated response with {len(references)} references and {len(top_images)} images")
+            
+            return {
+                "answer": response,
+                "references": references,
+                "images": top_images
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in ultra-accurate processing: {str(e)}")
+            return {
+                "answer": f"Error processing query: {str(e)}",
+                "references": [],
+                "images": []
+            }
+    
+    def _enhance_query(self, query: str) -> str:
+        """Enhance query for better retrieval."""
+        # Add domain-specific terms based on query content
+        enhanced_terms = []
+        
+        query_lower = query.lower()
+        
+        # Add related terms for better matching
+        if any(word in query_lower for word in ['chart', 'graph', 'data']):
+            enhanced_terms.extend(['visualization', 'statistics', 'analysis'])
+        
+        if any(word in query_lower for word in ['table', 'list']):
+            enhanced_terms.extend(['data', 'comparison', 'structure'])
+        
+        if any(word in query_lower for word in ['process', 'procedure']):
+            enhanced_terms.extend(['steps', 'methodology', 'workflow'])
+        
+        # Combine original query with enhancements
+        if enhanced_terms:
+            enhanced_query = f"{query} {' '.join(enhanced_terms)}"
+        else:
+            enhanced_query = query
+        
+        return enhanced_query
+    
+    def _prepare_enhanced_context(self, context_parts: List[str], images: List[Dict]) -> str:
+        """Prepare enhanced context with image information."""
+        context = "\n\n".join(context_parts)
+        
+        if images:
+            image_context = "\n\n=== RELEVANT VISUAL CONTENT ===\n"
+            for img in images:
+                img_context = f"""
+Image Reference [{img['reference_id']}] - {img['type'].title()} from {img['document']}, Page {img['page']}:
+- Analysis: {img['analysis']}
+- OCR Content: {img['ocr_text']}
+- Keywords: {', '.join(img['keywords'])}
+- Relevance: {img['relevance_score']:.2f}
+"""
+                image_context += img_context
+            
+            context += image_context
+        
+        return context
+    
+    def _create_enhanced_prompt(self, query: str, context: str, ref_links: Dict) -> str:
+        """Create enhanced prompt for better responses."""
+        
+        prompt = f"""You are an expert research assistant providing comprehensive, accurate analysis. Your task is to answer the user's question using ONLY the provided context with maximum accuracy and detail.
+
+CRITICAL ACCURACY REQUIREMENTS:
+1. Use ONLY information explicitly present in the provided context
+2. Add numbered citations [1], [2], etc. after EVERY factual statement
+3. For numerical data, charts, tables: be extremely precise and detailed
+4. For visual content: provide thorough descriptions and interpretations
+5. If information is insufficient, clearly state what cannot be determined
+6. Never make assumptions or add external knowledge
+
+RESPONSE STRUCTURE:
+1. Direct answer to the question with citations
+2. Supporting evidence with detailed explanations
+3. Visual content analysis (if applicable)
+4. Summary of key findings
+
+CONTEXT WITH REFERENCES:
 {context}
 
-{f"Previous Conversation:{chr(10)}{chat_history}" if chat_history else ""}
+AVAILABLE REFERENCE IDs: {list(ref_links.keys())}
 
-User Question: {inputs["question"]}
+USER QUESTION: {query}
 
-Citation Format Requirements:
-1. Begin EACH piece of information with: [Document: "filename.pdf", Page X-Y]
-2. Include section if available: [Document: "filename.pdf", Page X, Section Y: "Title"]
-3. For OCR-extracted content: [Document: "filename.pdf", Page X, Image/Figure]
-4. Be extremely specific about page numbers
-5. Never make up or guess page numbers
+INSTRUCTIONS FOR VISUAL CONTENT:
+- For charts/graphs: Describe data points, trends, axes, values precisely
+- For tables: Explain structure, key values, relationships systematically  
+- For diagrams: Detail components, connections, flow sequences
+- Always cite the specific image reference number
 
-Answer the question using ONLY the provided context:"""
-                
-                # Generate response using VertexGenAI
-                logger.info("Generating response with VertexGenAI...")
-                response_text = self.vertex_gen_ai.generate_content(prompt)
-                
-                if not response_text:
-                    response_text = "I apologize, but I couldn't generate a response. Please try rephrasing your question."
-                
-                logger.info("Successfully generated response")
-                return {
-                    "answer": response_text,
-                    "source_documents": docs
-                }
-                
-            except Exception as e:
-                logger.error(f"Error in custom chain: {str(e)}")
-                return {
-                    "answer": f"An error occurred while processing your question: {str(e)}",
-                    "source_documents": []
-                }
+Provide a comprehensive, well-researched response with precise citations for every claim:"""
+
+        return prompt
+    
+    def reset_conversation(self):
+        """Reset conversation history."""
+        self.conversation_history = []
+        self.reference_counter = 1
+        return "Conversation reset successfully."
+
+# Update the interface to use the new system
+class UltraAccurateInterface:
+    """Interface for ultra-accurate RAG system."""
+
+    def __init__(self):
+        self.rag_system = None
+        self.vertex_gen_ai = None
+        self.current_references = []
+        self.current_images = []
+        logger.info("Initialized UltraAccurateInterface")
+        self.setup_interface()
+
+    def setup_interface(self):
+        """Set up the ultra-accurate interface."""
         
-        return custom_chain
+        custom_css = """
+        .logo-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin-bottom: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .logo-text {
+            font-size: 28px;
+            font-weight: bold;
+            color: white;
+            text-align: center;
+        }
+        .accuracy-badge {
+            background: linear-gradient(45deg, #28a745, #20c997);
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .reference-card {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+            background: linear-gradient(135deg, #f8f9ff 0%, #f1f3ff 100%);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        .image-card {
+            border: 1px solid #ddd;
+            border-radius: 12px;
+            padding: 15px;
+            margin: 10px 0;
+            background: linear-gradient(135deg, #fff8f0 0%, #fff4e6 100%);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .score-badge {
+            display: inline-block;
+            background: #007bff;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            margin-left: 5px;
+        }
+        """
 
-    def _initialize_conversation_chain(self):
-        """Initialize the conversation chain with VertexGenAI."""
-        try:
-            if not self.hybrid_retriever:
-                logger.warning("No hybrid retriever available for conversation chain")
-                return
+        with gr.Blocks(theme=gr.themes.Soft(), css=custom_css, title="Ultra-Accurate Research Assistant") as self.interface:
+            
+            # Enhanced header
+            gr.HTML("""
+            <div class="logo-container">
+                <div style="margin-right: 15px; font-size: 32px;">🎯</div>
+                <div class="logo-text">
+                    Ultra-Accurate Research Assistant
+                    <div class="accuracy-badge">Enhanced with Hybrid Retrieval + Reranking</div>
+                </div>
+            </div>
+            """)
+            
+            # Enhanced chatbot
+            chatbot = gr.Chatbot(
+                height=500,
+                show_label=False,
+                avatar_images=("👤", "🔬"),
+                bubble_full_width=False,
+                show_copy_button=True,
+                likeable=True
+            )
+            
+            # Input with enhanced placeholder
+            with gr.Row():
+                msg_input = gr.Textbox(
+                    placeholder="Ask detailed questions about your documents (e.g., 'What are the key findings in the charts?', 'Explain the process diagram on page 5')",
+                    show_label=False,
+                    lines=2,
+                    scale=5
+                )
+            
+            # Enhanced three buttons
+            with gr.Row():
+                upload_btn = gr.Button("📤 Upload Documents", variant="primary", size="lg", scale=1)
+                ask_btn = gr.Button("🎯 Ask (Ultra-Accurate)", variant="secondary", size="lg", scale=1) 
+                reset_btn = gr.Button("🔄 Reset", variant="stop", size="lg", scale=1)
+            
+            upload_files = gr.File(
+                label="Select PDF Documents for Analysis",
+                file_types=[".pdf"],
+                file_count="multiple",
+                visible=False
+            )
+            
+            status_display = gr.Markdown("🤖 **Status:** Ready to initialize ultra-accurate system")
+            
+            # Enhanced references section
+            gr.Markdown("## 📚 Enhanced Text References (with Accuracy Scores)")
+            text_references = gr.HTML(value="<p>No references yet. Upload documents and ask questions to see detailed references with accuracy scores.</p>")
+            
+            # Enhanced images section
+            gr.Markdown("## 🖼️ Ultra-Accurate Visual References (Top 3 Most Relevant)")
+            
+            with gr.Row():
+                image1 = gr.Image(label="Most Relevant Image", visible=False, height=250)
+                image2 = gr.Image(label="Second Most Relevant", visible=False, height=250)
+                image3 = gr.Image(label="Third Most Relevant", visible=False, height=250)
+            
+            image_info = gr.HTML(value="<p>No visual content found yet. Upload documents with charts, diagrams, or tables to see them here.</p>")
+
+            initialized = gr.State(False)
+
+            # Enhanced event handlers
+            def handle_upload_click():
+                return gr.update(visible=True)
+            
+            def handle_upload_files(files, is_initialized):
+                if not is_initialized:
+                    try:
+                        self.vertex_gen_ai = VertexGenAI()
+                        test_response = self.vertex_gen_ai.generate_content("Test accuracy")
+                        if test_response:
+                            self.rag_system = UltraAccurateRAGSystem(vertex_gen_ai=self.vertex_gen_ai)
+                            is_initialized = True
+                        else:
+                            return "❌ Failed to initialize VertexAI for ultra-accurate processing", False, gr.update(visible=False)
+                    except Exception as e:
+                        return f"❌ Ultra-accurate initialization error: {str(e)}", False, gr.update(visible=False)
                 
-            if not self.vertex_gen_ai:
-                logger.warning("No VertexGenAI instance available for conversation chain")
-                return
+                if not files:
+                    return "❌ No files selected for processing", is_initialized, gr.update(visible=False)
+                
+                results = []
+                for file in files:
+                    try:
+                        result = self.rag_system.upload_pdf(file.name)
+                        results.append(result)
+                    except Exception as e:
+                        results.append(f"❌ Error processing {os.path.basename(file.name)}: {str(e)}")
+                
+                status = "## 📄 Ultra-Accurate Processing Results\n" + "\n".join(results)
+                return status, is_initialized, gr.update(visible=False)
+            
+            def handle_ask(message, history, is_initialized):
+                if not is_initialized or not self.rag_system:
+                    error_msg = "❌ Please upload documents first to enable ultra-accurate processing"
+                    if history is None:
+                        history = []
+                    return history + [[message, error_msg]], "", "", "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+                
+                if not message.strip():
+                    if history is None:
+                        history = []
+                    return history, message, "", "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+                
+                try:
+                    # Get ultra-accurate response
+                    result = self.rag_system.ask(message)
+                    answer = result["answer"]
+                    self.current_references = result["references"]
+                    self.current_images = result["images"]
+                    
+                    # Update chat history
+                    if history is None:
+                        history = []
+                    updated_history = history + [[message, answer]]
+                    
+                    # Format enhanced references
+                    text_refs_html = self._format_enhanced_references()
+                    
+                    # Format enhanced image info
+                    images_info_html = self._format_enhanced_images()
+                    
+                    # Prepare images for display
+                    img1, img2, img3 = self._prepare_enhanced_images()
+                    
+                    return (updated_history, "", text_refs_html, images_info_html, "",
+                           img1, img2, img3)
+                    
+                except Exception as e:
+                    error_msg = f"❌ Ultra-accurate processing error: {str(e)}"
+                    if history is None:
+                        history = []
+                    return (history + [[message, error_msg]], "", "", "", "",
+                           gr.update(visible=False), gr.update(visible=False), gr.update(visible=False))
+            
+            def handle_reset():
+                if self.rag_system:
+                    self.rag_system.reset_conversation()
+                self.current_references = []
+                self.current_images = []
+                return ([], "🔄 Ultra-accurate conversation reset", 
+                       "<p>No references yet.</p>", 
+                       "<p>No images yet.</p>",
+                       gr.update(visible=False), gr.update(visible=False), gr.update(visible=False))
+            
+            # Wire up events
+            upload_btn.click(fn=handle_upload_click, outputs=upload_files)
+            upload_files.upload(fn=handle_upload_files, inputs=[upload_files, initialized], outputs=[status_display, initialized, upload_files])
+            ask_btn.click(fn=handle_ask, inputs=[msg_input, chatbot, initialized], outputs=[chatbot, msg_input, text_references, image_info, status_display, image1, image2, image3])
+            msg_input.submit(fn=handle_ask, inputs=[msg_input, chatbot, initialized], outputs=[chatbot, msg_input, text_references, image_info, status_display, image1, image2, image3])
+            reset_btn.click(fn=handle_reset, outputs=[chatbot, status_display, text_references, image_info, image1, image2, image3])
 
-            logger.info("Initializing conversation chain...")
+    def _format_enhanced_references(self):
+        """Format references with enhanced accuracy information."""
+        if not self.current_references:
+            return "<p>No references available.</p>"
+        
+        html_parts = []
+        text_refs = [ref for ref in self.current_references if ref.get("type") != "image"]
+        
+        for ref in text_refs:
+            ref_id = ref["id"]
+            doc = ref["document"]
+            pages = ref["pages"]
+            final_score = ref.get("final_score", 0.0)
+            dense_score = ref.get("dense_score", 0.0)
+            sparse_score = ref.get("sparse_score", 0.0) 
+            rerank_score = ref.get("rerank_score", 0.0)
+            semantic_density = ref.get("semantic_density", 0.0)
+            content = ref["content"]
             
-            # Create a custom chain since VertexGenAI has a different interface
-            self.conversation_chain = self._create_custom_chain(self.hybrid_retriever.retriever)
+            # Format page numbers
+            if len(pages) > 1:
+                page_str = f"pp. {min(pages)}-{max(pages)}"
+            else:
+                page_str = f"p. {pages[0]}" if pages else "p. ?"
             
-            logger.info("Successfully initialized conversation chain")
+            ref_html = f"""
+            <div class="reference-card" id="ref{ref_id}">
+                <strong>[{ref_id}]</strong> 📄 {doc}, {page_str}
+                <span class="score-badge">Final: {final_score:.3f}</span>
+                <span class="score-badge">Dense: {dense_score:.3f}</span>
+                <span class="score-badge">Sparse: {sparse_score:.3f}</span>
+                {f'<span class="score-badge">Rerank: {rerank_score:.3f}</span>' if rerank_score > 0 else ''}
+                <br><small><strong>Semantic Density:</strong> {semantic_density:.1f} | <strong>Quality:</strong> {'High' if final_score > 0.7 else 'Medium' if final_score > 0.4 else 'Low'}</small>
+                <br><em>"{content}"</em>
+            </div>
+            """
+            html_parts.append(ref_html)
+        
+        if not html_parts:
+            return "<p>No text references found.</p>"
+        
+        return "".join(html_parts)
+
+    def _format_enhanced_images(self):
+        """Format image information with enhanced details."""
+        if not self.current_images:
+            return "<p>No relevant visual content found for this query.</p>"
+        
+        html_parts = []
+        for i, img in enumerate(self.current_images):
+            doc = img["document"]
+            page = img["page"]
+            img_type = img["type"]
+            analysis = img["analysis"]
+            confidence = img["confidence"]
+            relevance_score = img["relevance_score"]
+            ref_id = img.get("reference_id", "")
+            ocr_preview = img.get("ocr_text", "")[:100]
+            keywords = ", ".join(img.get("keywords", []))
+            
+            # Calculate combined score
+            combined_score = relevance_score * confidence
+            
+            img_html = f"""
+            <div class="image-card">
+                <strong>Image {i+1} {f'[{ref_id}]' if ref_id else ''}</strong> 🖼️ {img_type.title()}
+                <span class="score-badge">Relevance: {relevance_score:.3f}</span>
+                <span class="score-badge">Confidence: {confidence:.3f}</span>
+                <span class="score-badge">Combined: {combined_score:.3f}</span>
+                <br><strong>Source:</strong> {doc}, Page {page}
+                <br><strong>Analysis:</strong> {analysis}
+                {f'<br><strong>OCR Preview:</strong> "{ocr_preview}..."' if ocr_preview else ''}
+                {f'<br><strong>Keywords:</strong> {keywords}' if keywords else ''}
+            </div>
+            """
+            html_parts.append(img_html)
+        
+        return "".join(html_parts)
+
+    def _prepare_enhanced_images(self):
+        """Prepare enhanced images for display."""
+        img1 = gr.update(visible=False)
+        img2 = gr.update(visible=False) 
+        img3 = gr.update(visible=False)
+        
+        if not self.current_images:
+            return img1, img2, img3
+        
+        display_images = []
+        for img_data in self.current_images:
+            try:
+                img_bytes = base64.b64decode(img_data["base64"])
+                pil_image = Image.open(BytesIO(img_bytes))
+                display_images.append(pil_image)
             except Exception as e:
-           logger.error(f"Error initializing conversation chain: {str(e)}")
+                logger.error(f"Error converting image: {str(e)}")
+                continue
+        
+        # Enhanced labels with scores
+        if len(display_images) > 0:
+            img_data = self.current_images[0]
+            score = img_data['relevance_score'] * img_data['confidence']
+            img1 = gr.update(
+                value=display_images[0], 
+                visible=True,
+                label=f"🥇 {img_data['type'].title()} (Score: {score:.3f}) - {img_data['document']}"
+            )
+        
+        if len(display_images) > 1:
+            img_data = self.current_images[1]
+            score = img_data['relevance_score'] * img_data['confidence']
+            img2 = gr.update(
+                value=display_images[1],
+                visible=True,
+                label=f"🥈 {img_data['type'].title()} (Score: {score:.3f}) - {img_data['document']}"
+            )
+        
+        if len(display_images) > 2:
+            img_data = self.current_images[2]
+            score = img_data['relevance_score'] * img_data['confidence']
+            img3 = gr.update(
+                value=display_images[2],
+                visible=True,
+                label=f"🥉 {img_data['type'].title()} (Score: {score:.3f}) - {img_data['document']}"
+            )
+        
+        return img1, img2, img3
+
+def launch_ultra_accurate_rag():
+    """Launch the ultra-accurate RAG interface."""
+    interface = UltraAccurateInterface()
+    return interface.interface
 
-   def ask(self, query: str) -> Dict[str, Any]:
-       """Process a query and return answer with citations and relevant images."""
-       if not self.hybrid_retriever:
-           return {
-               "answer": "Please upload at least one document first. No retriever available.",
-               "citation_info": {},
-               "cited_pages": [],
-               "source_docs": [],
-               "relevant_images": []
-           }
-           
-       if not self.conversation_chain:
-           return {
-               "answer": "System not properly initialized. Please check VertexAI connection and upload documents.",
-               "citation_info": {},
-               "cited_pages": [],
-               "source_docs": [],
-               "relevant_images": []
-           }
-
-       try:
-           logger.info(f"Processing query: {query[:50]}...")
-           
-           # Execute the chain
-           result = self.conversation_chain({"question": query})
-
-           # Extract answer
-           answer = result.get("answer", "No answer generated")
-           source_docs = result.get("source_documents", [])
-
-           # Find relevant images from source documents
-           relevant_images = []
-           for doc in source_docs:
-               metadata = doc.metadata
-               doc_filename = metadata.get("source", "")
-               image_refs = metadata.get("image_refs", [])
-               
-               # Get the document
-               if doc_filename in self.documents:
-                   pdf_doc = self.documents[doc_filename]
-                   for img_idx in image_refs:
-                       if img_idx < len(pdf_doc.images):
-                           img_data = pdf_doc.images[img_idx]
-                           relevant_images.append({
-                               "document": doc_filename,
-                               "page": img_data.page_number,
-                               "base64": img_data.base64_string,
-                               "ocr_text": img_data.ocr_text[:100] + "..." if len(img_data.ocr_text) > 100 else img_data.ocr_text
-                           })
-
-           # Extract citation info
-           citation_info = self._extract_cited_pages(answer)
-
-           # Add to conversation history
-           self.conversation_history.append((query, answer))
-
-           # Get all cited pages
-           all_pages = []
-           for doc_citations in citation_info.values():
-               for citation in doc_citations:
-                   all_pages.extend(citation["pages"])
-
-           logger.info(f"Successfully processed query. Found {len(relevant_images)} relevant images.")
-
-           return {
-               "answer": answer,
-               "citation_info": citation_info,
-               "cited_pages": sorted(list(set(all_pages))),
-               "source_docs": source_docs,
-               "relevant_images": relevant_images
-           }
-       except Exception as e:
-           logger.error(f"Error in ask method: {str(e)}")
-           return {
-               "answer": f"Error processing query: {str(e)}",
-               "citation_info": {},
-               "cited_pages": [],
-               "source_docs": [],
-               "relevant_images": []
-           }
-
-   def _extract_cited_pages(self, text: str) -> Dict[str, List[Dict[str, Any]]]:
-       """Extract citation information from the text."""
-       if not text:
-           return {}
-
-       citations = {}
-
-       # Updated pattern to handle image citations
-       doc_pattern = r'\[Document:\s*"([^"]+)",\s*Page(?:s)?\s*(\d+)(?:-(\d+))?(?:,\s*(?:Section\s*([^:]+):\s*"([^"]+)"|Image/Figure))?\]'
-
-       try:
-           for match in re.finditer(doc_pattern, text):
-               try:
-                   doc_name = match.group(1)
-                   start_page = int(match.group(2))
-                   end_page = int(match.group(3)) if match.group(3) else start_page
-                   pages = list(range(start_page, end_page + 1))
-
-                   section_num = match.group(4) if match.group(4) else None
-                   section_title = match.group(5) if match.group(5) else None
-
-                   if doc_name not in citations:
-                       citations[doc_name] = []
-
-                   citations[doc_name].append({
-                       "pages": pages,
-                       "section_num": section_num,
-                       "section_title": section_title
-                   })
-
-               except (ValueError, IndexError) as e:
-                   logger.error(f"Error parsing citation: {match.group(0)}, error: {str(e)}")
-                   continue
-
-           return citations
-       except Exception as e:
-           logger.error(f"Error extracting citations: {str(e)}")
-           return {}
-
-   def reset_conversation(self):
-       """Reset the conversation history."""
-       self.conversation_history = []
-       logger.info("Conversation history reset")
-       return "Conversation history has been reset."
-
-   def get_document_stats(self) -> Dict[str, Dict[str, Any]]:
-       """Get statistics about uploaded documents."""
-       stats = {}
-       for name, doc in self.documents.items():
-           stats[name] = {
-               "pages": len(doc.pages),
-               "chunks": len(doc.chunks),
-               "total_chars": len(doc.content),
-               "images": len(doc.images),
-               "images_with_ocr": sum(1 for img in doc.images if img.ocr_text)
-           }
-       return stats
-
-   def save_index(self, path: str):
-       """Save the FAISS index to disk."""
-       if self.hybrid_retriever:
-           return self.hybrid_retriever.save_index(path)
-       return "No index to save. Please upload documents first."
-
-class GradioRAGInterface:
-   """Gradio interface for the RAG system with image display support."""
-
-   def __init__(self):
-       self.rag_system = None
-       self.temp_dir = tempfile.mkdtemp()
-       self.vertex_gen_ai = None
-       logger.info("Initialized GradioRAGInterface")
-       self.setup_interface()
-
-   def setup_interface(self):
-       """Set up the Gradio interface."""
-       with gr.Blocks(theme=gr.themes.Base()) as self.interface:
-           gr.Markdown("# Advanced PDF Chat with Document, Page, Section Citations and Image References")
-
-           with gr.Row():
-               with gr.Column(scale=1):
-                   # System Configuration
-                   gr.Markdown("## 🤖 System Configuration")
-
-                   # VertexAI Settings
-                   with gr.Group():
-                       ca_bundle_path = gr.Textbox(
-                           label="CA Bundle Path (optional)",
-                           placeholder="Path to PROD CA pem file",
-                           value=""
-                       )
-                       initialize_vertex_btn = gr.Button("Initialize VertexAI", variant="primary")
-                       vertex_status = gr.Textbox(label="VertexAI Status", value="Not initialized")
-
-                   # Vector DB settings
-                   gr.Markdown("## 💾 Vector Database Settings")
-                   use_existing_db = gr.Checkbox(label="Use Existing FAISS Index", value=False)
-
-                   with gr.Group(visible=False) as faiss_settings:
-                       faiss_path = gr.Textbox(
-                           label="FAISS Index Path",
-                           placeholder="Path to existing FAISS index"
-                       )
-
-                   # OCR Settings
-                   gr.Markdown("## 🔍 OCR Settings")
-                   enable_ocr = gr.Checkbox(label="Enable OCR for Images", value=True)
-
-                   initialize_btn = gr.Button("Initialize System")
-
-                   # Document upload section
-                   gr.Markdown("## 📄 Upload Documents")
-                   pdf_upload = gr.File(
-                       label="Upload PDF Documents",
-                       file_types=[".pdf"],
-                       file_count="multiple"
-                   )
-                   upload_button = gr.Button("Process PDFs")
-                   save_index_button = gr.Button("Save FAISS Index")
-                   faiss_save_path = gr.Textbox(
-                       label="Save FAISS Index To",
-                       placeholder="Path to save the current FAISS index",
-                       value="/content/faiss_index"
-                   )
-                   doc_status = gr.Markdown("No documents uploaded yet.")
-
-                   # System controls
-                   gr.Markdown("## ⚙️ System Controls")
-                   reset_btn = gr.Button("Reset Conversation")
-
-               with gr.Column(scale=2):
-                   # Chat interface
-                   gr.Markdown("## 💬 Chat With Your Documents")
-                   chatbot = gr.Chatbot(height=400, elem_id="chatbot")
-                   msg = gr.Textbox(
-                       placeholder="Ask a question about your documents...",
-                       label="Your Question",
-                       lines=1
-                   )
-                   submit_btn = gr.Button("Ask", variant="primary")
-
-                   # Citation information with enhanced display
-                   gr.Markdown("## 📊 Citation Information")
-                   with gr.Accordion("Document References", open=True):
-                       citation_display = gr.JSON(label="Citations by Document")
-
-                   # Image references
-                   gr.Markdown("## 🖼️ Referenced Images")
-                   with gr.Accordion("Images from Documents", open=True):
-                       image_gallery = gr.Gallery(
-                           label="Relevant Images",
-                           show_label=True,
-                           elem_id="gallery",
-                           columns=2,
-                           rows=2,
-                           height="auto"
-                       )
-                       image_info = gr.JSON(label="Image Information")
-
-                   with gr.Accordion("Document Statistics", open=False):
-                       doc_stats = gr.JSON(label="Document Statistics")
-
-           # Set up event handlers for showing/hiding FAISS settings
-           use_existing_db.change(
-               fn=lambda x: gr.update(visible=x),
-               inputs=[use_existing_db],
-               outputs=[faiss_settings]
-           )
-
-           # Initialize VertexAI button
-           initialize_vertex_btn.click(
-               fn=self.initialize_vertex_ai,
-               inputs=[ca_bundle_path],
-               outputs=[vertex_status]
-           )
-
-           # Initialize system button logic
-           initialize_btn.click(
-               fn=self.initialize_system,
-               inputs=[
-                   use_existing_db,
-                   faiss_path,
-                   enable_ocr
-               ],
-               outputs=[doc_status]
-           )
-
-           # Save FAISS index button
-           save_index_button.click(
-               fn=self.save_faiss_index,
-               inputs=[faiss_save_path],
-               outputs=[doc_status]
-           )
-
-           # Add event handlers for existing functionality
-           upload_button.click(
-               fn=self.upload_documents,
-               inputs=[pdf_upload],
-               outputs=[doc_status, doc_stats]
-           )
-
-           # Chat handlers with image support
-           def safe_chat_handler(message, history):
-               try:
-                   if history is None:
-                       history = []
-                   result = self.chat_with_docs(message, history)
-                   return result
-               except Exception as e:
-                   logger.error(f"Error in chat handler: {str(e)}")
-                   if history is None:
-                       history = []
-                   return history + [[message, f"Error: {str(e)}"]], "", {}, [], {}
-
-           submit_btn.click(
-               fn=safe_chat_handler,
-               inputs=[msg, chatbot],
-               outputs=[chatbot, msg, citation_display, image_gallery, image_info]
-           )
-
-           msg.submit(
-               fn=safe_chat_handler,
-               inputs=[msg, chatbot],
-               outputs=[chatbot, msg, citation_display, image_gallery, image_info]
-           )
-
-           reset_btn.click(
-               fn=self.reset_chat,
-               inputs=[],
-               outputs=[chatbot, doc_status, citation_display, image_gallery, image_info]
-           )
-
-   def initialize_vertex_ai(self, ca_bundle_path):
-       """Initialize VertexAI instance."""
-       try:
-           logger.info("Initializing VertexAI...")
-           
-           # Set the CA bundle if provided
-           if ca_bundle_path and os.path.exists(ca_bundle_path):
-               os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle_path
-               logger.info(f"Set CA bundle path to: {ca_bundle_path}")
-           
-           # Initialize VertexGenAI
-           self.vertex_gen_ai = VertexGenAI()
-           
-           # Test the connection with both generation and embedding
-           logger.info("Testing VertexAI connection...")
-           test_prompt = "Hello, this is a test."
-           
-           try:
-               test_response = self.vertex_gen_ai.generate_content(test_prompt)
-               generation_works = bool(test_response)
-           except Exception as e:
-               logger.error(f"Generation test failed: {str(e)}")
-               generation_works = False
-           
-           try:
-               test_embedding = self.vertex_gen_ai.get_embeddings([test_prompt])
-               embeddings_work = bool(test_embedding and len(test_embedding) > 0)
-           except Exception as e:
-               logger.error(f"Embeddings test failed: {str(e)}")
-               embeddings_work = False
-           
-           if generation_works and embeddings_work:
-               logger.info("VertexAI initialization successful")
-               return "✅ VertexAI initialized successfully! Both generation and embeddings are working."
-           elif generation_works:
-               logger.warning("VertexAI generation works but embeddings failed")
-               return "⚠️ VertexAI generation works but embeddings failed. Check your embedding model access."
-           elif embeddings_work:
-               logger.warning("VertexAI embeddings work but generation failed")
-               return "⚠️ VertexAI embeddings work but generation failed. Check your generative model access."
-           else:
-               logger.error("Both VertexAI generation and embeddings failed")
-               return "❌ VertexAI initialized but both generation and embeddings failed. Check your credentials and model access."
-               
-       except Exception as e:
-           error_msg = f"❌ Failed to initialize VertexAI: {str(e)}"
-           logger.error(error_msg)
-           return error_msg
-
-   def initialize_system(self, use_existing_db, faiss_path, enable_ocr):
-       """Initialize the RAG system with settings."""
-       try:
-           logger.info("Initializing RAG system...")
-
-           if not self.vertex_gen_ai:
-               return "Please initialize VertexAI first."
-
-           # Validate FAISS path if using existing DB
-           if use_existing_db and (not faiss_path or not os.path.exists(faiss_path)):
-               return "Please enter a valid path to an existing FAISS index."
-
-           # Create the RAG system with appropriate settings
-           self.rag_system = AdvancedRAGSystem(
-               vertex_gen_ai=self.vertex_gen_ai,
-               faiss_index_path=faiss_path if use_existing_db else None,
-               enable_ocr=enable_ocr
-           )
-
-           ocr_status = "enabled" if enable_ocr else "disabled"
-           if use_existing_db:
-               result = f"✅ System initialized with VertexAI using existing FAISS index at {faiss_path}! OCR is {ocr_status}."
-           else:
-               result = f"✅ System initialized with VertexAI! OCR is {ocr_status}. You can now upload documents."
-           
-           logger.info("RAG system initialization successful")
-           return result
-
-       except Exception as e:
-           error_msg = f"❌ Error initializing system: {str(e)}"
-           logger.error(error_msg)
-           return error_msg
-
-   def save_faiss_index(self, save_path):
-       """Save the current FAISS index to disk."""
-       if not self.rag_system or not self.rag_system.hybrid_retriever:
-           return "Please initialize the system and upload documents first."
-
-       if not save_path:
-           return "Please provide a valid path to save the FAISS index."
-
-       try:
-           result = self.rag_system.save_index(save_path)
-           return f"✅ {result}"
-       except Exception as e:
-           return f"❌ Error saving FAISS index: {str(e)}"
-
-   def upload_documents(self, files):
-       """Upload and process documents."""
-       if not self.rag_system:
-           return "Please initialize the system first.", {}
-
-       if not files:
-           return "No files selected for upload.", {}
-
-       results = []
-
-       for file in files:
-           try:
-               result = self.rag_system.upload_pdf(file.name)
-               results.append(f"✅ {result}")
-           except Exception as e:
-               error_msg = f"❌ Error processing {os.path.basename(file.name)}: {str(e)}"
-               results.append(error_msg)
-               logger.error(error_msg)
-
-       # Get enhanced document stats for display
-       doc_stats = self._get_enhanced_doc_stats()
-
-       status = "## Document Processing Results\n" + "\n".join(results)
-       return status, doc_stats
-
-   def _get_enhanced_doc_stats(self):
-       """Get enhanced statistics about uploaded documents including image information."""
-       if not self.rag_system:
-           return {}
-
-       stats = {}
-       for name, doc in self.rag_system.documents.items():
-           # Count sections found per document
-           sections = set()
-           for chunk in doc.chunks:
-               for section_key, section_title in chunk.section_info.items():
-                   sections.add(f"{section_key}: {section_title}")
-
-           # Image statistics
-           images_with_text = sum(1 for img in doc.images if img.ocr_text)
-
-           stats[name] = {
-               "Total Pages": len(doc.pages),
-               "Total Chunks": len(doc.chunks),
-               "Characters": len(doc.content),
-               "Sections Found": len(sections),
-               "Section Examples": list(sections)[:5] if sections else "None found",
-               "Total Images": len(doc.images),
-               "Images with OCR Text": images_with_text
-           }
-       return stats
-
-   def chat_with_docs(self, message, history=None):
-       """Process a chat message and get a response with images."""
-       if history is None:
-           history = []
-
-       if not self.rag_system:
-           return history + [[message, "Please initialize the system and upload documents first."]], "", {}, [], {}
-
-       if not self.rag_system.documents:
-           return history + [[message, "Please upload at least one document before asking questions."]], "", {}, [], {}
-
-       if not message or not message.strip():
-           return history + [[message, "Please enter a question."]], "", {}, [], {}
-
-       try:
-           logger.info(f"Processing chat message: {message[:50]}...")
-           
-           # Process the query
-           start_time = time.time()
-           response = self.rag_system.ask(message)
-           process_time = time.time() - start_time
-
-           answer = response["answer"]
-           citation_info = response.get("citation_info", {})
-           relevant_images = response.get("relevant_images", [])
-
-           # Add processing time info
-           answer += f"\n\n_Query processed in {process_time:.2f} seconds._"
-
-           # Update chatbot history
-           updated_history = list(history)
-           updated_history.append([message, answer])
-
-           # Format citation info for display
-           formatted_citations = {}
-           for doc_name, citations in citation_info.items():
-               doc_citations = []
-               for citation in citations:
-                   pages_str = "-".join(map(str, [min(citation["pages"]), max(citation["pages"])])) if len(citation["pages"]) > 1 else str(citation["pages"][0])
-                   section_info = ""
-                   if citation["section_num"] and citation["section_title"]:
-                       section_info = f", Section {citation['section_num']}: \"{citation['section_title']}\""
-                   elif citation["section_num"]:
-                       section_info = f", Section {citation['section_num']}"
-                   elif citation["section_title"]:
-                       section_info = f", Section: \"{citation['section_title']}\""
-
-                   doc_citations.append(f"Page(s) {pages_str}{section_info}")
-
-               formatted_citations[doc_name] = doc_citations
-
-           # Prepare images for gallery
-           gallery_images = []
-           image_details = []
-
-           for img_data in relevant_images:
-               try:
-                   # Convert base64 to PIL Image for gallery
-                   img_bytes = base64.b64decode(img_data["base64"])
-                   img = Image.open(BytesIO(img_bytes))
-                   
-                   # Add to gallery
-                   gallery_images.append(img)
-                   
-                   # Add details
-                   image_details.append({
-                       "document": img_data["document"],
-                       "page": img_data["page"],
-                       "ocr_preview": img_data["ocr_text"]
-                   })
-               except Exception as e:
-                   logger.error(f"Error processing image for gallery: {str(e)}")
-
-           # Return results
-           page_info = {
-               "Citation Information": formatted_citations,
-               "Documents Referenced": len(citation_info),
-               "Images Found": len(relevant_images)
-           }
-
-           logger.info(f"Successfully processed chat message. Found {len(relevant_images)} images.")
-           return updated_history, "", page_info, gallery_images, {"images": image_details}
-
-       except Exception as e:
-           error_msg = f"Error: {str(e)}"
-           logger.error(f"Error in chat: {str(e)}")
-           return history + [[message, error_msg]], "", {}, [], {}
-
-   def reset_chat(self):
-       """Reset the chat conversation."""
-       if self.rag_system:
-           self.rag_system.reset_conversation()
-
-       doc_status = "Conversation has been reset."
-       if self.rag_system and self.rag_system.documents:
-           doc_names = list(self.rag_system.documents.keys())
-           doc_status += f"\nLoaded documents: {', '.join(doc_names)}"
-
-       return [], doc_status, {}, [], {}
-
-# Helper function for Google Authentication
-def setup_google_auth():
-   """Set up Google authentication if using Vertex AI."""
-   try:
-       from google.colab import auth
-       auth.authenticate_user()
-       print("Google authentication completed successfully.")
-       return True
-   except ImportError:
-       print("Not running in Google Colab. Please ensure you're authenticated for Vertex AI.")
-       return False
-
-# Export the interface for easy import in Colab
-def launch_rag_interface():
-   """Launch the RAG interface."""
-   interface = GradioRAGInterface()
-   return interface.interface
-
-# Main entry point for running
 def main():
-   """Main function to launch the application."""
-   print("Starting Advanced PDF RAG System with VertexAI and Image Support")
-   
-   # Check if we're in Colab
-   try:
-       import google.colab
-       print("Running in Google Colab environment")
-
-       # Set up authentication
-       print("\n== Setting up Google Authentication ==")
-       if setup_google_auth():
-           print("Authentication successful!")
-       
-       # Create directories
-       os.makedirs("/content/faiss_index", exist_ok=True)
-       print("Created directory for FAISS indices at /content/faiss_index")
-
-       print("\n== IMPORTANT NOTES ==")
-       print("1. Click 'Initialize VertexAI' button first")
-       print("2. Optionally provide CA Bundle path if needed")
-       print("3. Make sure your Google Cloud project has Vertex AI API enabled")
-       print("4. The system will use your project's Vertex AI for embeddings and generation")
-       print("5. Images in PDFs will be extracted and OCR will be performed if enabled")
-       
-   except ImportError:
-       print("Not running in Google Colab environment")
-
-   # Set the CA bundle path if needed
-   if os.path.exists("<Path to PROD CA pem file>"):
-       os.environ["REQUESTS_CA_BUNDLE"] = "<Path to PROD CA pem file>"
-
-   # Launch the interface
-   interface = launch_rag_interface()
-   interface.launch(
-       server_name="0.0.0.0",
-       server_port=7860,
-       share=True,
-       debug=False,
-       show_error=True
-   )
-   print("\nRAG System is running. Access the interface through the provided URL.")
+    """Main function with enhanced system."""
+    print("🎯 Starting Ultra-Accurate RAG System")
+    
+    try:
+        import google.colab
+        print("📱 Running in Google Colab")
+        from google.colab import auth
+        auth.authenticate_user()
+        print("✅ Authentication completed")
+    except ImportError:
+        print("💻 Running in local environment")
+    
+    print("\n🚀 **Ultra-Accurate Features:**")
+    print("- 🔍 Hybrid retrieval: Dense (HNSW) + Sparse (BM25)")
+    print("- 🎯 Cross-encoder reranking for maximum accuracy")
+    print("- 🖼️ Semantic image-text matching")
+    print("- 📊 Enhanced chunking with context preservation")
+    print("- 🔗 Multi-stage relevance filtering")
+    print("- 📈 Accuracy scoring and quality metrics")
+    
+    interface = launch_ultra_accurate_rag()
+    interface.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=True,
+        debug=False,
+        show_error=True
+    )
 
 if __name__ == "__main__":
-   main()
+    main()
