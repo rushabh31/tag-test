@@ -162,12 +162,72 @@ class PDFDocument:
     def langchain_documents(self) -> List[Document]:
         return [chunk.to_document() for chunk in self.chunks]
 
+import time
+from typing import Dict, Optional
+import hashlib
+
 class SemanticImageMatcher:
-    """Semantic matching between queries and images using VertexAI embeddings."""
+    """Semantic matching between queries and images using VertexAI embeddings with rate limiting and caching."""
     
     def __init__(self, gen_ai_provider: VertexGenAI):
         self.gen_ai_provider = gen_ai_provider
-        logger.info("Initialized SemanticImageMatcher with VertexAI")
+        self.embedding_cache: Dict[str, List[float]] = {}  # Cache for embeddings
+        self.last_request_time = 0
+        self.min_request_interval = 1.0  # Minimum 1 second between requests
+        self.max_retries = 3
+        logger.info("Initialized SemanticImageMatcher with VertexAI and caching")
+    
+    def _get_cache_key(self, text: str) -> str:
+        """Generate a cache key for text."""
+        return hashlib.md5(text.encode()).hexdigest()
+    
+    def _rate_limit_sleep(self):
+        """Ensure we don't exceed rate limits."""
+        current_time = time.time()
+        time_since_last_request = current_time - self.last_request_time
+        if time_since_last_request < self.min_request_interval:
+            sleep_time = self.min_request_interval - time_since_last_request
+            time.sleep(sleep_time)
+        self.last_request_time = time.time()
+    
+    def _get_embedding_with_retry(self, text: str) -> Optional[List[float]]:
+        """Get embedding with rate limiting, caching, and retry logic."""
+        # Check cache first
+        cache_key = self._get_cache_key(text)
+        if cache_key in self.embedding_cache:
+            return self.embedding_cache[cache_key]
+        
+        # Rate limiting
+        self._rate_limit_sleep()
+        
+        for attempt in range(self.max_retries):
+            try:
+                embeddings_response = self.gen_ai_provider.get_embeddings([text])
+                if embeddings_response and len(embeddings_response) > 0:
+                    embedding = embeddings_response[0].values
+                    # Cache the result
+                    self.embedding_cache[cache_key] = embedding
+                    return embedding
+                else:
+                    logger.warning(f"Empty embedding response for text: {text[:50]}...")
+                    return None
+                    
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "rate" in error_str.lower():
+                    # Rate limit hit, exponential backoff
+                    wait_time = (2 ** attempt) * 2  # 2, 4, 8 seconds
+                    logger.warning(f"Rate limit hit (attempt {attempt + 1}/{self.max_retries}), waiting {wait_time}s")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Error getting embedding (attempt {attempt + 1}): {e}")
+                    if attempt == self.max_retries - 1:
+                        return None
+                    time.sleep(1)  # Brief pause before retry
+        
+        logger.error(f"Failed to get embedding after {self.max_retries} attempts")
+        return None
     
     def extract_keywords(self, text: str) -> List[str]:
         """Extract semantic keywords from text."""
@@ -192,30 +252,37 @@ class SemanticImageMatcher:
         return list(set(keywords))
     
     def calculate_image_relevance(self, query: str, image: EnhancedImageData) -> float:
-        """Calculate semantic relevance between query and image using VertexAI embeddings."""
+        """Calculate semantic relevance between query and image using VertexAI embeddings with caching."""
         try:
-            # Get embeddings from VertexAI
-            query_embeddings = self.gen_ai_provider.get_embeddings([query])
-            if not query_embeddings:
+            # Get query embedding with caching and rate limiting
+            query_embedding = self._get_embedding_with_retry(query)
+            if query_embedding is None:
+                logger.warning("Failed to get query embedding, falling back to keyword similarity")
                 return self._keyword_similarity(query, image)
-                
-            query_embedding = np.array(query_embeddings[0].values)
+            
+            query_embedding = np.array(query_embedding)
             
             # Combine OCR text and analysis for image representation
             image_text = f"{image.ocr_text} {image.analysis} {' '.join(image.semantic_keywords)}"
             if not image_text.strip():
                 return 0.0
-                
-            image_embeddings = self.gen_ai_provider.get_embeddings([image_text])
-            if not image_embeddings:
+            
+            # Get image embedding with caching and rate limiting
+            image_embedding = self._get_embedding_with_retry(image_text)
+            if image_embedding is None:
+                logger.warning("Failed to get image embedding, falling back to keyword similarity")
                 return self._keyword_similarity(query, image)
-                
-            image_embedding = np.array(image_embeddings[0].values)
+            
+            image_embedding = np.array(image_embedding)
             
             # Calculate cosine similarity
-            similarity = np.dot(query_embedding, image_embedding) / (
-                np.linalg.norm(query_embedding) * np.linalg.norm(image_embedding)
-            )
+            try:
+                similarity = np.dot(query_embedding, image_embedding) / (
+                    np.linalg.norm(query_embedding) * np.linalg.norm(image_embedding)
+                )
+            except Exception as e:
+                logger.error(f"Error calculating cosine similarity: {e}")
+                return self._keyword_similarity(query, image)
             
             # Boost score based on image confidence and type relevance
             type_boost = self._get_type_relevance_boost(query, image.image_type)
@@ -254,7 +321,12 @@ class SemanticImageMatcher:
         }
         
         return type_boosts.get(image_type, 0.0)
-
+    
+    def clear_cache(self):
+        """Clear the embedding cache."""
+        self.embedding_cache.clear()
+        logger.info("Embedding cache cleared")
+        
 class AdvancedPDFProcessor:
     """Advanced PDF processor with enhanced chunking and image analysis."""
 
@@ -1004,15 +1076,69 @@ class VertexAIEmbeddings(Embeddings):
     async def aembed_query(self, text: str) -> List[float]:
         return self.embed_query(text)
 
+
 class CustomReranker:
-    """Custom reranker using VertexAI semantic similarity and keyword matching."""
+    """Custom reranker using VertexAI semantic similarity and keyword matching with rate limiting."""
     
     def __init__(self, gen_ai_provider: VertexGenAI):
         self.gen_ai_provider = gen_ai_provider
-        logger.info("Initialized CustomReranker with VertexAI")
+        self.embedding_cache: Dict[str, List[float]] = {}
+        self.last_request_time = 0
+        self.min_request_interval = 1.0
+        self.max_retries = 3
+        logger.info("Initialized CustomReranker with VertexAI and caching")
+    
+    def _get_cache_key(self, text: str) -> str:
+        """Generate a cache key for text."""
+        return hashlib.md5(text.encode()).hexdigest()
+    
+    def _rate_limit_sleep(self):
+        """Ensure we don't exceed rate limits."""
+        current_time = time.time()
+        time_since_last_request = current_time - self.last_request_time
+        if time_since_last_request < self.min_request_interval:
+            sleep_time = self.min_request_interval - time_since_last_request
+            time.sleep(sleep_time)
+        self.last_request_time = time.time()
+    
+    def _get_embedding_with_retry(self, text: str) -> Optional[List[float]]:
+        """Get embedding with rate limiting, caching, and retry logic."""
+        # Check cache first
+        cache_key = self._get_cache_key(text)
+        if cache_key in self.embedding_cache:
+            return self.embedding_cache[cache_key]
+        
+        # Rate limiting
+        self._rate_limit_sleep()
+        
+        for attempt in range(self.max_retries):
+            try:
+                embeddings_response = self.gen_ai_provider.get_embeddings([text])
+                if embeddings_response and len(embeddings_response) > 0:
+                    embedding = embeddings_response[0].values
+                    # Cache the result
+                    self.embedding_cache[cache_key] = embedding
+                    return embedding
+                else:
+                    return None
+                    
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "rate" in error_str.lower():
+                    wait_time = (2 ** attempt) * 2
+                    logger.warning(f"Rate limit hit in reranker (attempt {attempt + 1}), waiting {wait_time}s")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Error getting embedding in reranker: {e}")
+                    if attempt == self.max_retries - 1:
+                        return None
+                    time.sleep(1)
+        
+        return None
     
     def rerank(self, query: str, documents: List[Document], top_k: int = None) -> List[Tuple[Document, float]]:
-        """Rerank documents using custom scoring."""
+        """Rerank documents using custom scoring with rate limiting."""
         if not documents:
             return []
         
@@ -1020,14 +1146,8 @@ class CustomReranker:
             top_k = len(documents)
         
         try:
-            # Get query embedding using VertexAI
-            query_embedding = None
-            try:
-                query_embeddings = self.gen_ai_provider.get_embeddings([query])
-                if query_embeddings and len(query_embeddings) > 0:
-                    query_embedding = np.array(query_embeddings[0].values)
-            except Exception as e:
-                logger.warning(f"Could not get query embedding for reranking: {e}")
+            # Get query embedding with caching and rate limiting
+            query_embedding = self._get_embedding_with_retry(query)
             
             # Score each document
             scored_docs = []
@@ -1044,7 +1164,7 @@ class CustomReranker:
             # Fallback: return documents with original scores
             return [(doc, doc.metadata.get('combined_score', 0.5)) for doc in documents[:top_k]]
     
-    def _calculate_custom_score(self, query: str, doc: Document, query_embedding: np.ndarray = None) -> float:
+    def _calculate_custom_score(self, query: str, doc: Document, query_embedding: Optional[List[float]] = None) -> float:
         """Calculate custom relevance score for a document."""
         score = 0.0
         
@@ -1054,9 +1174,13 @@ class CustomReranker:
         # 1. Semantic similarity (40% weight) using VertexAI
         if query_embedding is not None:
             try:
-                doc_embeddings = self.gen_ai_provider.get_embeddings([doc_text])
-                if doc_embeddings and len(doc_embeddings) > 0:
-                    doc_embedding = np.array(doc_embeddings[0].values)
+                # Convert to numpy array if it's a list
+                if isinstance(query_embedding, list):
+                    query_embedding = np.array(query_embedding)
+                
+                doc_embedding = self._get_embedding_with_retry(doc_text)
+                if doc_embedding is not None:
+                    doc_embedding = np.array(doc_embedding)
                     semantic_sim = np.dot(query_embedding, doc_embedding) / (
                         np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding)
                     )
