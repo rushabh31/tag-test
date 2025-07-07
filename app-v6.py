@@ -335,39 +335,64 @@ class AdvancedPDFProcessor:
         return " ".join(context_pages)
 
     def _extract_page_images(self, page_image: Image.Image, page_num: int, 
-                             page_context: str) -> List[EnhancedImageData]:
+                         page_context: str) -> List[EnhancedImageData]:
         """Extract images from a single page with context."""
         images = []
         
         try:
             opencv_image = cv2.cvtColor(np.array(page_image), cv2.COLOR_RGB2BGR)
-            if opencv_image is None or opencv_image.size == 0:
-                logger.error("opencv_image is empty or None")
+            
+            # Proper numpy array checking
+            if opencv_image is None:
+                logger.error("opencv_image is None")
                 return images
+            if not hasattr(opencv_image, 'size') or opencv_image.size == 0:
+                logger.error("opencv_image is empty or has no size attribute")
+                return images
+                
             gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-            if gray is None or gray.size == 0:
-                logger.error("gray image is empty or None")
+            if gray is None:
+                logger.error("gray image is None")
                 return images
+            if not hasattr(gray, 'size') or gray.size == 0:
+                logger.error("gray image is empty or has no size attribute")
+                return images
+                
             # Enhanced edge detection
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            if blurred is None or blurred.size == 0:
-                logger.error("blurred image is empty or None")
+            if blurred is None:
+                logger.error("blurred image is None")
                 return images
+            if not hasattr(blurred, 'size') or blurred.size == 0:
+                logger.error("blurred image is empty or has no size attribute")
+                return images
+                
             edges = cv2.Canny(blurred, 30, 80)
-            if edges is None or edges.size == 0:
-                logger.error("edges image is empty or None")
+            if edges is None:
+                logger.error("edges image is None")
                 return images
+            if not hasattr(edges, 'size') or edges.size == 0:
+                logger.error("edges image is empty or has no size attribute")
+                return images
+                
             # Morphological operations to connect nearby edges
             kernel = np.ones((3, 3), np.uint8)
-            if kernel is None or kernel.size == 0:
-                logger.error("kernel is empty or None")
+            if kernel is None:
+                logger.error("kernel is None")
                 return images
+            if not hasattr(kernel, 'size') or kernel.size == 0:
+                logger.error("kernel is empty or has no size attribute")
+                return images
+                
             edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
             
             contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Proper contours checking
             if contours is None or len(contours) == 0:
                 logger.warning("No contours found on page %d", page_num)
                 return images
+                
             # Filter and sort contours by area
             min_area = 5000
             valid_contours = []
@@ -379,9 +404,11 @@ class AdvancedPDFProcessor:
                 except Exception as e:
                     logger.warning(f"Error calculating contour area: {e}")
                     continue
+                    
             if len(valid_contours) == 0:
                 logger.info(f"No valid contours found on page {page_num}")
                 return images
+                
             valid_contours.sort(reverse=True)  # Largest first
             
             processed_count = 0
@@ -398,18 +425,7 @@ class AdvancedPDFProcessor:
                     continue
                     
         except Exception as e:
-            # Extra debug for ambiguous truth value errors
-            import sys
-            err_msg = str(e)
-            if 'ambiguous' in err_msg:
-                logger.error(f"Ambiguous truth value error: {err_msg}")
-                logger.error(f"Type of opencv_image: {type(opencv_image)}, shape: {getattr(opencv_image, 'shape', None)}")
-                logger.error(f"Type of gray: {type(gray)}, shape: {getattr(gray, 'shape', None)}")
-                logger.error(f"Type of blurred: {type(blurred)}, shape: {getattr(blurred, 'shape', None)}")
-                logger.error(f"Type of edges: {type(edges)}, shape: {getattr(edges, 'shape', None)}")
-                logger.error(f"Type of kernel: {type(kernel)}, shape: {getattr(kernel, 'shape', None)}")
-                logger.error(f"Type of contours: {type(contours)}, len: {len(contours) if contours is not None else None}")
-            logger.error(f"Error extracting page images: {err_msg}")
+            logger.error(f"Error extracting page images: {str(e)}")
             
         return images
 
@@ -491,37 +507,63 @@ class AdvancedPDFProcessor:
             return None
 
     def _analyze_image_enhanced(self, image: Image.Image, ocr_text: str, 
-                                context: str) -> Tuple[str, str, float]:
+                            context: str) -> Tuple[str, str, float]:
         """Enhanced image analysis with context."""
         try:
             img_array = np.array(image)
-            if img_array is None or img_array.size == 0:
-                logger.error("Image array is empty or None")
+            
+            # Proper numpy array checking
+            if img_array is None:
+                logger.error("Image array is None")
+                return "figure", "Image array is None", 0.0
+            if not hasattr(img_array, 'size') or img_array.size == 0:
+                logger.error("Image array is empty or has no size attribute")
                 return "figure", "Image array is empty", 0.0
+                
             height, width = img_array.shape[:2]
             
             # Calculate image statistics
             gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
-            if gray is None or gray.size == 0:
-                logger.error("Gray image array is empty or None")
+            if gray is None:
+                logger.error("Gray image array is None")
+                return "figure", "Gray image array is None", 0.0
+            if not hasattr(gray, 'size') or gray.size == 0:
+                logger.error("Gray image array is empty or has no size attribute")
                 return "figure", "Gray image array is empty", 0.0
-            # Defensive: never use a numpy array in a boolean context
+                
             # Detect lines (for tables/charts)
             horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
             vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
-            if horizontal_kernel is None or horizontal_kernel.size == 0:
-                logger.error("horizontal_kernel is empty or None")
+            
+            if horizontal_kernel is None:
+                logger.error("horizontal_kernel is None")
+                return "figure", "horizontal_kernel is None", 0.0
+            if not hasattr(horizontal_kernel, 'size') or horizontal_kernel.size == 0:
+                logger.error("horizontal_kernel is empty or has no size attribute")
                 return "figure", "horizontal_kernel is empty", 0.0
-            if vertical_kernel is None or vertical_kernel.size == 0:
-                logger.error("vertical_kernel is empty or None")
+                
+            if vertical_kernel is None:
+                logger.error("vertical_kernel is None")
+                return "figure", "vertical_kernel is None", 0.0
+            if not hasattr(vertical_kernel, 'size') or vertical_kernel.size == 0:
+                logger.error("vertical_kernel is empty or has no size attribute")
                 return "figure", "vertical_kernel is empty", 0.0
+                
             horizontal_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, horizontal_kernel)
             vertical_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, vertical_kernel)
-            if horizontal_lines is None or horizontal_lines.size == 0:
-                logger.error("horizontal_lines is empty or None")
+            
+            if horizontal_lines is None:
+                logger.error("horizontal_lines is None")
+                return "figure", "horizontal_lines is None", 0.0
+            if not hasattr(horizontal_lines, 'size') or horizontal_lines.size == 0:
+                logger.error("horizontal_lines is empty or has no size attribute")
                 return "figure", "horizontal_lines is empty", 0.0
-            if vertical_lines is None or vertical_lines.size == 0:
-                logger.error("vertical_lines is empty or None")
+                
+            if vertical_lines is None:
+                logger.error("vertical_lines is None")
+                return "figure", "vertical_lines is None", 0.0
+            if not hasattr(vertical_lines, 'size') or vertical_lines.size == 0:
+                logger.error("vertical_lines is empty or has no size attribute")
                 return "figure", "vertical_lines is empty", 0.0
             
             # Analyze text characteristics
@@ -533,8 +575,11 @@ class AdvancedPDFProcessor:
             image_type = "figure"
             analysis = ""
             
-            # Table detection
-            if (float(horizontal_lines.sum()) > 100 and float(vertical_lines.sum()) > 100) or \
+            # Table detection - use proper numpy array sum
+            horizontal_sum = float(np.sum(horizontal_lines))
+            vertical_sum = float(np.sum(vertical_lines))
+            
+            if (horizontal_sum > 100 and vertical_sum > 100) or \
                any(word in text_lower for word in ['table', 'row', 'column', '|']):
                 image_type = "table"
                 confidence = 0.8
