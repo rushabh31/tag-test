@@ -342,60 +342,89 @@ class AdvancedPDFProcessor:
         try:
             opencv_image = cv2.cvtColor(np.array(page_image), cv2.COLOR_RGB2BGR)
             
-            # Proper numpy array checking
-            if opencv_image is None:
-                logger.error("opencv_image is None")
-                return images
-            if not hasattr(opencv_image, 'size') or opencv_image.size == 0:
-                logger.error("opencv_image is empty or has no size attribute")
+            # Proper numpy array checking - avoid any boolean context usage
+            try:
+                if opencv_image is None:
+                    logger.error("opencv_image is None")
+                    return images
+                # Check size as an integer, not in boolean context
+                if opencv_image.size == 0:
+                    logger.error("opencv_image is empty")
+                    return images
+            except Exception as e:
+                logger.error(f"Error checking opencv_image: {e}")
                 return images
                 
-            gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-            if gray is None:
-                logger.error("gray image is None")
-                return images
-            if not hasattr(gray, 'size') or gray.size == 0:
-                logger.error("gray image is empty or has no size attribute")
+            try:
+                gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+                if gray is None:
+                    logger.error("gray image is None")
+                    return images
+                if gray.size == 0:
+                    logger.error("gray image is empty")
+                    return images
+            except Exception as e:
+                logger.error(f"Error creating gray image: {e}")
                 return images
                 
             # Enhanced edge detection
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            if blurred is None:
-                logger.error("blurred image is None")
-                return images
-            if not hasattr(blurred, 'size') or blurred.size == 0:
-                logger.error("blurred image is empty or has no size attribute")
+            try:
+                blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+                if blurred is None:
+                    logger.error("blurred image is None")
+                    return images
+                if blurred.size == 0:
+                    logger.error("blurred image is empty")
+                    return images
+            except Exception as e:
+                logger.error(f"Error creating blurred image: {e}")
                 return images
                 
-            edges = cv2.Canny(blurred, 30, 80)
-            if edges is None:
-                logger.error("edges image is None")
-                return images
-            if not hasattr(edges, 'size') or edges.size == 0:
-                logger.error("edges image is empty or has no size attribute")
+            try:
+                edges = cv2.Canny(blurred, 30, 80)
+                if edges is None:
+                    logger.error("edges image is None")
+                    return images
+                if edges.size == 0:
+                    logger.error("edges image is empty")
+                    return images
+            except Exception as e:
+                logger.error(f"Error creating edges: {e}")
                 return images
                 
             # Morphological operations to connect nearby edges
-            kernel = np.ones((3, 3), np.uint8)
-            if kernel is None:
-                logger.error("kernel is None")
+            try:
+                kernel = np.ones((3, 3), np.uint8)
+                if kernel is None:
+                    logger.error("kernel is None")
+                    return images
+                if kernel.size == 0:
+                    logger.error("kernel is empty")
+                    return images
+                    
+                edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+            except Exception as e:
+                logger.error(f"Error in morphological operations: {e}")
                 return images
-            if not hasattr(kernel, 'size') or kernel.size == 0:
-                logger.error("kernel is empty or has no size attribute")
-                return images
+            
+            try:
+                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
-            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-            
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Proper contours checking
-            if contours is None or len(contours) == 0:
-                logger.warning("No contours found on page %d", page_num)
+                # Proper contours checking - avoid boolean context
+                if contours is None:
+                    logger.warning("contours is None on page %d", page_num)
+                    return images
+                if len(contours) == 0:
+                    logger.warning("No contours found on page %d", page_num)
+                    return images
+            except Exception as e:
+                logger.error(f"Error finding contours: {e}")
                 return images
                 
             # Filter and sort contours by area
             min_area = 5000
             valid_contours = []
+            
             for c in contours:
                 try:
                     area = cv2.contourArea(c)
@@ -417,7 +446,7 @@ class AdvancedPDFProcessor:
                     image_data = self._process_image_region(
                         page_image, contour, page_num, page_context, processed_count
                     )
-                    if image_data is not None and hasattr(image_data, 'confidence') and image_data.confidence > 0.4:  # Only high-confidence images
+                    if image_data is not None and hasattr(image_data, 'confidence') and image_data.confidence > 0.4:
                         images.append(image_data)
                         processed_count += 1
                 except Exception as e:
@@ -512,59 +541,69 @@ class AdvancedPDFProcessor:
         try:
             img_array = np.array(image)
             
-            # Proper numpy array checking
-            if img_array is None:
-                logger.error("Image array is None")
-                return "figure", "Image array is None", 0.0
-            if not hasattr(img_array, 'size') or img_array.size == 0:
-                logger.error("Image array is empty or has no size attribute")
-                return "figure", "Image array is empty", 0.0
+            # Proper numpy array checking - avoid boolean context
+            try:
+                if img_array is None:
+                    logger.error("Image array is None")
+                    return "figure", "Image array is None", 0.0
+                if img_array.size == 0:
+                    logger.error("Image array is empty")
+                    return "figure", "Image array is empty", 0.0
+            except Exception as e:
+                logger.error(f"Error checking image array: {e}")
+                return "figure", f"Image array check error: {str(e)}", 0.0
                 
-            height, width = img_array.shape[:2]
+            try:
+                height, width = img_array.shape[:2]
+            except Exception as e:
+                logger.error(f"Error getting image dimensions: {e}")
+                return "figure", f"Dimension error: {str(e)}", 0.0
             
             # Calculate image statistics
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY) if len(img_array.shape) == 3 else img_array
-            if gray is None:
-                logger.error("Gray image array is None")
-                return "figure", "Gray image array is None", 0.0
-            if not hasattr(gray, 'size') or gray.size == 0:
-                logger.error("Gray image array is empty or has no size attribute")
-                return "figure", "Gray image array is empty", 0.0
+            try:
+                if len(img_array.shape) == 3:
+                    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                else:
+                    gray = img_array
+                    
+                if gray is None:
+                    logger.error("Gray image array is None")
+                    return "figure", "Gray image array is None", 0.0
+                if gray.size == 0:
+                    logger.error("Gray image array is empty")
+                    return "figure", "Gray image array is empty", 0.0
+            except Exception as e:
+                logger.error(f"Error creating gray image: {e}")
+                return "figure", f"Gray conversion error: {str(e)}", 0.0
                 
             # Detect lines (for tables/charts)
-            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
-            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
-            
-            if horizontal_kernel is None:
-                logger.error("horizontal_kernel is None")
-                return "figure", "horizontal_kernel is None", 0.0
-            if not hasattr(horizontal_kernel, 'size') or horizontal_kernel.size == 0:
-                logger.error("horizontal_kernel is empty or has no size attribute")
-                return "figure", "horizontal_kernel is empty", 0.0
+            try:
+                horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+                vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
                 
-            if vertical_kernel is None:
-                logger.error("vertical_kernel is None")
-                return "figure", "vertical_kernel is None", 0.0
-            if not hasattr(vertical_kernel, 'size') or vertical_kernel.size == 0:
-                logger.error("vertical_kernel is empty or has no size attribute")
-                return "figure", "vertical_kernel is empty", 0.0
+                if horizontal_kernel is None or horizontal_kernel.size == 0:
+                    logger.error("horizontal_kernel is invalid")
+                    return "figure", "horizontal_kernel is invalid", 0.0
+                    
+                if vertical_kernel is None or vertical_kernel.size == 0:
+                    logger.error("vertical_kernel is invalid")
+                    return "figure", "vertical_kernel is invalid", 0.0
+                    
+                horizontal_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, horizontal_kernel)
+                vertical_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, vertical_kernel)
                 
-            horizontal_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, horizontal_kernel)
-            vertical_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, vertical_kernel)
-            
-            if horizontal_lines is None:
-                logger.error("horizontal_lines is None")
-                return "figure", "horizontal_lines is None", 0.0
-            if not hasattr(horizontal_lines, 'size') or horizontal_lines.size == 0:
-                logger.error("horizontal_lines is empty or has no size attribute")
-                return "figure", "horizontal_lines is empty", 0.0
-                
-            if vertical_lines is None:
-                logger.error("vertical_lines is None")
-                return "figure", "vertical_lines is None", 0.0
-            if not hasattr(vertical_lines, 'size') or vertical_lines.size == 0:
-                logger.error("vertical_lines is empty or has no size attribute")
-                return "figure", "vertical_lines is empty", 0.0
+                if horizontal_lines is None or horizontal_lines.size == 0:
+                    logger.error("horizontal_lines is invalid")
+                    return "figure", "horizontal_lines is invalid", 0.0
+                    
+                if vertical_lines is None or vertical_lines.size == 0:
+                    logger.error("vertical_lines is invalid")
+                    return "figure", "vertical_lines is invalid", 0.0
+            except Exception as e:
+                logger.error(f"Error in line detection: {e}")
+                # Continue without line detection
+                horizontal_lines = np.zeros_like(gray)
+                vertical_lines = np.zeros_like(gray)
             
             # Analyze text characteristics
             text_lower = ocr_text.lower()
@@ -575,58 +614,69 @@ class AdvancedPDFProcessor:
             image_type = "figure"
             analysis = ""
             
-            # Table detection - use proper numpy array sum
-            horizontal_sum = float(np.sum(horizontal_lines))
-            vertical_sum = float(np.sum(vertical_lines))
-            
-            if (horizontal_sum > 100 and vertical_sum > 100) or \
-               any(word in text_lower for word in ['table', 'row', 'column', '|']):
-                image_type = "table"
-                confidence = 0.8
-                analysis = f"Table with structured data containing {len(ocr_text.split())} text elements."
-                if ocr_text:
-                    # Count potential rows/columns
-                    rows = len([line for line in ocr_text.split('\n') if line.strip()])
-                    analysis += f" Estimated {rows} rows of data."
-            
-            # Chart/Graph detection
-            elif any(word in text_lower for word in ['%', 'chart', 'graph', 'axis', 'plot']) or \
-                 len(re.findall(r'\d+\.?\d*%', text_lower)) > 2:
-                image_type = "chart"
-                confidence = 0.9
-                percentages = re.findall(r'\d+\.?\d*%', text_lower)
-                numbers = re.findall(r'\d+\.?\d*', text_lower)
-                analysis = f"Chart/Graph with {len(numbers)} numeric values"
-                if percentages:
-                    analysis += f" including {len(percentages)} percentages"
-                analysis += f". Key data: {', '.join(percentages[:3])}" if percentages else ""
-            
-            # Diagram/Flow detection
-            elif any(word in text_lower for word in ['flow', 'process', 'step', 'arrow', 'diagram']) or \
-                 any(word in context_lower for word in ['process', 'workflow', 'procedure']):
-                image_type = "diagram"
-                confidence = 0.7
-                analysis = f"Process diagram or flowchart showing workflow steps."
-                if ocr_text:
-                    steps = len([word for word in text_lower.split() if word in ['step', '1', '2', '3', '4', '5']])
-                    if steps > 0:
-                        analysis += f" Contains approximately {steps} process steps."
-            
-            # Figure detection with context
-            else:
-                confidence = 0.5
-                analysis = f"Figure or illustration"
-                if ocr_text:
-                    analysis += f" with descriptive text: '{ocr_text[:100]}...'" if len(ocr_text) > 100 else f" with text: '{ocr_text}'"
+            try:
+                # Table detection - use proper numpy array sum, ensure scalar result
+                horizontal_sum = float(np.sum(horizontal_lines))
+                vertical_sum = float(np.sum(vertical_lines))
+                
+                # Use explicit threshold comparisons to avoid array boolean issues
+                has_horizontal_lines = horizontal_sum > 100
+                has_vertical_lines = vertical_sum > 100
+                has_table_keywords = any(word in text_lower for word in ['table', 'row', 'column', '|'])
+                
+                if (has_horizontal_lines and has_vertical_lines) or has_table_keywords:
+                    image_type = "table"
+                    confidence = 0.8
+                    analysis = f"Table with structured data containing {len(ocr_text.split())} text elements."
+                    if ocr_text:
+                        # Count potential rows/columns
+                        rows = len([line for line in ocr_text.split('\n') if line.strip()])
+                        analysis += f" Estimated {rows} rows of data."
+                
+                # Chart/Graph detection
+                elif any(word in text_lower for word in ['%', 'chart', 'graph', 'axis', 'plot']) or \
+                     len(re.findall(r'\d+\.?\d*%', text_lower)) > 2:
+                    image_type = "chart"
+                    confidence = 0.9
+                    percentages = re.findall(r'\d+\.?\d*%', text_lower)
+                    numbers = re.findall(r'\d+\.?\d*', text_lower)
+                    analysis = f"Chart/Graph with {len(numbers)} numeric values"
+                    if percentages:
+                        analysis += f" including {len(percentages)} percentages"
+                    analysis += f". Key data: {', '.join(percentages[:3])}" if percentages else ""
+                
+                # Diagram/Flow detection
+                elif any(word in text_lower for word in ['flow', 'process', 'step', 'arrow', 'diagram']) or \
+                     any(word in context_lower for word in ['process', 'workflow', 'procedure']):
+                    image_type = "diagram"
+                    confidence = 0.7
+                    analysis = f"Process diagram or flowchart showing workflow steps."
+                    if ocr_text:
+                        steps = len([word for word in text_lower.split() if word in ['step', '1', '2', '3', '4', '5']])
+                        if steps > 0:
+                            analysis += f" Contains approximately {steps} process steps."
+                
+                # Figure detection with context
                 else:
-                    analysis += " (visual content without readable text)"
-            
-            # Boost confidence based on context relevance
-            if any(word in context_lower for word in [image_type, 'figure', 'table', 'chart']):
-                confidence = min(confidence + 0.2, 1.0)
-            
-            # Add dimensional and quality info
-            analysis += f" [Size: {width}x{height}px, Quality: {'High' if min(float(width), float(height)) > 150 else 'Medium'}]"
+                    confidence = 0.5
+                    analysis = f"Figure or illustration"
+                    if ocr_text:
+                        analysis += f" with descriptive text: '{ocr_text[:100]}...'" if len(ocr_text) > 100 else f" with text: '{ocr_text}'"
+                    else:
+                        analysis += " (visual content without readable text)"
+                
+                # Boost confidence based on context relevance
+                if any(word in context_lower for word in [image_type, 'figure', 'table', 'chart']):
+                    confidence = min(confidence + 0.2, 1.0)
+                
+                # Add dimensional and quality info
+                analysis += f" [Size: {width}x{height}px, Quality: {'High' if min(width, height) > 150 else 'Medium'}]"
+                
+            except Exception as e:
+                logger.error(f"Error in image type detection: {e}")
+                # Fallback to basic analysis
+                confidence = 0.5
+                analysis = f"Figure or illustration [Size: {width}x{height}px]"
             
             return image_type, analysis, confidence
             
