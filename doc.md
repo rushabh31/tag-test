@@ -1,203 +1,235 @@
-⸻
+# AI-Assisted Investigation System Documentation
 
-AI-Driven Investigation Automation Framework: Architecture & Workflow
+## Overview
 
-⸻
+This documentation describes a comprehensive AI-powered investigation and data analysis system designed to automate complex investigation workflows through intelligent agent coordination and semantic data operations. The system employs a two-phase approach combining human oversight with automated execution to deliver thorough, actionable investigation results.
 
-Overview
+## System Architecture
 
-This solution automates and enhances risk or incident event investigations using a multi-agent AI system, combining LLM-based semantic reasoning with programmable data operations. The design ensures that investigation steps are explainable, repeatable, and efficient, with humans reviewing and approving the AI-generated plans before execution.
+### Core Philosophy
+The system is built on a multi-agent architecture where specialized AI agents collaborate under the supervision of a central coordinator to execute complex investigation plans. Each agent has distinct capabilities and responsibilities, enabling parallel processing and specialized handling of different data sources and operations.
 
-⸻
+## Two-Phase Operational Framework
 
-Architecture and Approach
+### Phase 1: AI-Assisted Investigation Plan Generation
 
-Phases of Operation
+**Objective**: Generate detailed, step-by-step investigation plans based on user queries and available knowledge resources.
 
-Phase 1: AI-Assisted Investigation Plan Generation
-	•	User Input: The process begins when a user reports a risk or incident event (e.g., misuse of an impersonation feature causing a financial loss).
-	•	AI Planning: The system uses an LLM, guided by a curated prompt and referencing a knowledge base (business rules, system metadata, known patterns), to generate a step-by-step investigation plan. This plan:
-	•	Specifies required data sources for each step.
-	•	Outlines semantic and data operations (filtering, joining, aggregating, summarizing).
-	•	Connects each step logically toward resolving the user’s query.
-	•	Human-in-the-Loop: The user or investigator reviews, edits, and approves the generated plan.
+**Process Flow**:
+1. **Input Collection**: Users provide investigation queries through a chatbot-like UI interface
+2. **Knowledge Integration**: The system leverages its knowledge base including:
+   - Business Guidance documentation
+   - System & Fields Metadata
+   - Existing action/patterns information
+3. **Plan Generation**: An LLM generates a comprehensive, actionable investigation plan using curated prompt templates
+4. **Human Review**: Users review the generated plan and can provide feedback or request modifications
+5. **Plan Approval**: Once satisfied, users approve the plan to proceed to Phase 2
 
-Phase 2: Automated Semantic Execution Using AI Agents
-	•	After approval, the investigation plan is executed step-by-step by a team of AI agents, each responsible for a specific function:
-	•	SupervisorAgent: Orchestrates the workflow, delegates tasks, and maintains execution state.
-	•	IOAgent: Fetches input data from files, databases, or APIs.
-	•	SemanticAgent: Applies LLM-driven semantic reasoning for filtering, joining, aggregation, summarization, and semantic search.
-	•	REPLAgent: Executes programmable, custom data logic (Python code) for transformations, statistical analysis, or advanced data manipulation.
-	•	ReportAgent: Compiles and generates the final investigation report.
+**Key Features**:
+- Interactive chatbot interface for intuitive query input
+- Integration with comprehensive knowledge bases
+- Human-in-the-loop validation ensures plan accuracy and relevance
+- Flexible plan modification based on user feedback
 
-⸻
+### Phase 2: Automated Semantic Execution using AI Agents
 
-Agents and Their Responsibilities
+**Objective**: Execute the approved investigation plan through coordinated agent actions across relevant data sources.
 
-Agent	Role
-SupervisorAgent	Manages the investigation plan, workflow, and state. Delegates and sequences agent tasks.
-IOAgent	Handles input operations—loads data from files, APIs, or databases.
-SemanticAgent	Executes semantic/natural language operations: filtering, joining, extracting, aggregating, searching, ranking, and summarizing data.
-REPLAgent	Executes custom Python code for data cleaning, transformation, complex joins, analytics, or visualizations. Works alongside SemanticAgent as needed.
-ReportAgent	Generates the final, comprehensive investigation report from the results of all steps.
+**Process Flow**:
+1. **Plan Parsing**: The SupervisorAgent parses the approved investigation plan
+2. **Agent Coordination**: Based on plan requirements, the supervisor coordinates appropriate agents
+3. **Parallel Execution**: Multiple agents execute their assigned tasks simultaneously
+4. **Data Integration**: Results from various agents are consolidated in the global state
+5. **Report Generation**: Final comprehensive report is generated based on all collected data
 
+**Key Features**:
+- Automated execution reduces manual effort and human error
+- Semantic operators enable natural language-based data operations
+- Parallel processing improves efficiency
+- Comprehensive result aggregation and reporting
 
-⸻
+## Agent Architecture
 
-End-to-End Execution Flow (with Example)
+### SupervisorAgent
+**Primary Role**: Central coordinator responsible for workflow management, state coordination, and inter-agent communication.
 
-Example Scenario
+**Key Responsibilities**:
+- Interpreting investigation plans and determining required agent actions
+- Managing the global state and ensuring data consistency
+- Coordinating between worker agents based on current state and user requests
+- Orchestrating the overall investigation workflow
+- Verifying completion of investigation steps
+- Generating final execution reports
 
-Event:
-A developer utilized the FWS application’s “impersonation” feature (ID 123456), logged in as a trader, and accidentally cancelled a trade transaction worth $10MM.
+**Decision Logic**: The SupervisorAgent uses the current state and user request to determine which specific agent should execute the next required action.
 
-Investigation Plan (Generated by LLM and Approved by User):
-	1.	Review Operational Events data from ABC to find and understand the event.
-	2.	Review BCD data for a list of applications with “impersonation” log-in feature and identify each application deployment status (production or development).
-	3.	Review EFG entitlements data for each ID to identify the number of individuals with access to impersonation features and further understand the magnitude of the risk.
-	4.	Verify each application status listed in ID with its respective active server location listed in GFT to identify the true application deployment status.
-	5.	Review email from ORM Governance.
-	6.	Review IST data to find the associated Issue and CAP to further understand the event and remediation plan.
+### IOAgent (Input/Output Agent)
+**Primary Role**: Handles all data input operations from various sources.
 
-⸻
+**Available Operations**:
+- `get_data_from_excel`: Loads and processes data from Excel files
+- `get_data_from_csv`: Loads and processes data from CSV files  
+- `get_data_using_api`: Fetches data from external systems using APIs
 
-Detailed Step-by-Step Execution with Agents
+**Key Responsibilities**:
+- Consuming data requests and loading data to the global state
+- Handling different file formats and data sources
+- Ensuring data integrity during the loading process
+- Managing connection protocols for various data sources
 
-Step 1: Review Operational Events data from ABC
-	•	IOAgent: Fetches ABC operational events data (from API, Excel, CSV, etc.).
-	•	SemanticAgent: Filters for records relevant to the impersonation event.
-	•	REPLAgent (if needed):
-	•	Parses timestamps, aggregates by user/trader, computes statistics, or cleans/normalizes event logs.
-	•	SupervisorAgent: Validates that the event has been fully captured; if not, requests additional data processing by REPLAgent.
+### REPLAgent (Read-Eval-Print Loop Agent)
+**Primary Role**: Performs data transformation and analysis using Python code execution.
 
-⸻
+**Available Operations**:
+- `Execute_code`: Executes provided Python code in a REPL environment
 
-Step 2: Review BCD data for impersonation apps and deployment status
-	•	IOAgent: Loads BCD data listing all applications with the impersonation login feature.
-	•	SemanticAgent: Extracts application list and deployment status.
-	•	REPLAgent:
-	•	Standardizes status fields (e.g., “prod” vs “production”).
-	•	Cross-references with results from Step 1 to focus on impacted applications.
-	•	Summarizes or flags status inconsistencies.
-	•	SupervisorAgent: Confirms outputs meet the requirements.
+**Key Responsibilities**:
+- Transforming data using REPL (Read-Eval-Print Loop) operations
+- Consuming transformation requests and proposing appropriate Python code
+- Executing code in a controlled environment
+- Storing transformation results in the global state
+- Maintaining execution status across multiple function calls
 
-⸻
+### ReportAgent
+**Primary Role**: Generates comprehensive final reports based on investigation results.
 
-Step 3: Review EFG entitlements data for access/risk analysis
-	•	IOAgent: Fetches EFG entitlements data for all impersonation-enabled IDs.
-	•	SemanticAgent: Identifies individuals with access to the impersonation feature.
-	•	REPLAgent:
-	•	Aggregates user access counts, produces summary statistics or risk rankings.
-	•	Flags unusual or high-risk access patterns.
-	•	Integrates with findings from previous steps.
-	•	SupervisorAgent: Reviews for completeness and clarity.
+**Key Responsibilities**:
+- Consuming investigation results from the global state
+- Generating structured, comprehensive reports
+- Synthesizing findings from multiple data sources
+- Presenting results in user-friendly formats
+- Ensuring report completeness and accuracy
 
-⸻
+### SemanticAgent
+**Primary Role**: Handles semantic requests and natural language-based data operations.
 
-Step 4: Verify application status in ID with active server location in GFT
-	•	IOAgent: Loads application status (ID) and active server locations (GFT).
-	•	SemanticAgent: Semantically matches application status with server location.
-	•	REPLAgent:
-	•	Performs detailed joins (e.g., fuzzy matching app names).
-	•	Flags discrepancies (e.g., development apps running on production servers).
-	•	Aggregates deployment info by environment.
-	•	SupervisorAgent: Checks for mismatches and accuracy.
+**Available Semantic Operations**:
 
-⸻
+#### Data Mapping and Transformation
+- `sem_map`: Maps each record using natural language projections
+- `sem_extract`: Extracts one or more attributes from each row using natural language queries
 
-Step 5: Review email from ORM Governance
-	•	IOAgent: Retrieves relevant ORM Governance emails.
-	•	SemanticAgent: Performs semantic search for event-specific or governance-relevant emails.
-	•	REPLAgent:
-	•	Runs NLP code (keyword extraction, summarization, sentiment analysis).
-	•	Highlights compliance, escalations, or governance actions.
-	•	SupervisorAgent: Ensures extracted guidance is actionable and complete.
+#### Filtering and Selection
+- `sem_filter`: Keeps records that match natural language predicates
+- `sem_search`: Performs semantic search over text columns
 
-⸻
+#### Aggregation and Summarization
+- `sem_agg`: Aggregates across all records (e.g., for summarization purposes)
 
-Step 6: Review IST data for associated Issue and CAP
-	•	IOAgent: Loads IST data on issues and corrective action plans for implicated applications.
-	•	SemanticAgent: Filters for relevant Issues and CAPs.
-	•	REPLAgent:
-	•	Analyzes CAPs for overdue/missing actions.
-	•	Summarizes remediation timelines, owner assignments, and effectiveness.
-	•	Correlates IST records with findings from earlier steps.
-	•	SupervisorAgent: Validates remediation status and actionability.
+#### Sorting and Ranking
+- `sem_topk`: Orders records by natural language sorting criteria
 
-⸻
+#### Data Joining
+- `sem_join`: Joins two datasets based on natural language predicates
+- `sem_sim_join`: Joins two DataFrames based on semantic similarity
 
-Final Step: Report Generation
-	•	ReportAgent: Compiles all results, findings, and analytics from the global state.
-	•	REPLAgent (if needed):
-	•	Generates visualizations, final data aggregations, or tabular summaries for the report.
-	•	ReportAgent: Produces a comprehensive investigation report, ready for audit, review, or escalation.
+**Key Responsibilities**:
+- Processing semantic requests using natural language specifications
+- Determining appropriate semantic operators for given requests
+- Enabling intuitive, natural language-based data manipulation
+- Bridging the gap between human intent and data operations
 
-⸻
+## Example Investigation Workflow
 
-Agent Interaction and Control Flow
-	1.	SupervisorAgent orchestrates each step, monitors completion, and ensures correct sequencing.
-	2.	For each step, IOAgent fetches required data, SemanticAgent applies LLM-powered logic, and REPLAgent handles any programmable or custom code needed for advanced processing.
-	3.	If any step fails or results are insufficient, SupervisorAgent can:
-	•	Trigger a retry,
-	•	Request additional data transformation (via REPLAgent),
-	•	Escalate to human review,
-	•	Adjust the investigation plan with user input.
-	4.	Once all steps are validated, ReportAgent finalizes the output.
+### Scenario
+**Event Occurrence**: Developer utilized the FWS application (ID 123456) "impersonation" feature, logged in as a trader, and accidentally cancelled a trade transaction worth $10MM.
 
-⸻
+### Generated Investigation Plan
 
-Visualized Execution Flow (Including REPLAgent)
+1. **Operational Events Review**
+   - Review Operational Events data from ABC to find and understand the specific event
+   - Identify patterns and anomalies related to the impersonation feature usage
 
-flowchart TD
-    Start --> S1[Step 1: IOAgent fetches ABC data]
-    S1 --> S1b[SemanticAgent filters ABC data]
-    S1b --> S1c[REPLAgent transforms/analyzes data]
-    S1c --> S2[Step 2: IOAgent fetches BCD data]
-    S2 --> S2b[SemanticAgent processes BCD]
-    S2b --> S2c[REPLAgent cross-references/transforms]
-    S2c --> S3[Step 3: IOAgent fetches EFG data]
-    S3 --> S3b[SemanticAgent processes EFG]
-    S3b --> S3c[REPLAgent aggregates/analyzes]
-    S3c --> S4[Step 4: IOAgent fetches ID & GFT data]
-    S4 --> S4b[SemanticAgent joins/verifies]
-    S4b --> S4c[REPLAgent flags discrepancies]
-    S4c --> S5[Step 5: IOAgent fetches ORM emails]
-    S5 --> S5b[SemanticAgent extracts relevant info]
-    S5b --> S5c[REPLAgent summarizes/NLP]
-    S5c --> S6[Step 6: IOAgent fetches IST data]
-    S6 --> S6b[SemanticAgent finds CAPs]
-    S6b --> S6c[REPLAgent analyzes remediation]
-    S6c --> Report[ReportAgent compiles report]
-    Report --> End
+2. **Application Analysis**
+   - Review BCD data for applications with "impersonation" login features
+   - Identify each application's deployment status (production or development)
+   - Map the scope of applications with similar vulnerability
 
+3. **Access Control Assessment**
+   - Review EFG entitlements data for each identified application
+   - Determine the number of individuals with access to impersonation features
+   - Assess the magnitude of potential risk exposure
 
-⸻
+4. **Deployment Status Verification**
+   - Verify each application status listed in ID systems
+   - Cross-reference with active server locations in GFT
+   - Identify true application deployment status across environments
 
-Key Features & Benefits
-	•	Explainable: Each step is transparent, documented, and auditable.
-	•	Efficient: Automates data fetching, filtering, processing, and reporting.
-	•	Flexible: Easily adapts to new event types, systems, or investigation needs.
-	•	Composable: Can add or modify agent roles as business or technical needs evolve.
-	•	Human-in-the-Loop: Ensures quality and correctness with optional expert review.
+5. **Governance Review**
+   - Review data from ORM Governance systems
+   - Ensure compliance with established access control policies
+   - Identify any governance gaps or violations
 
-⸻
+6. **Issue Tracking and Remediation**
+   - Review IST data to find associated issues and CAP (Corrective Action Plans)
+   - Understand existing remediation efforts
+   - Develop comprehensive remediation strategy
 
-Summary Table of Main Components
+### Execution Flow
 
-Component	Description
-SupervisorAgent	Orchestrates the workflow and maintains investigation state.
-IOAgent	Handles all data loading from files, APIs, or databases.
-SemanticAgent	Applies LLM-driven, natural language logic for semantic analysis and data operations.
-REPLAgent	Executes custom Python code for data transformation, advanced joins, or analytics.
-ReportAgent	Compiles and formats the final investigation report.
+1. **Initiation**: SupervisorAgent receives the approved investigation plan
+2. **Data Collection**: IOAgent fetches data from ABC, BCD, EFG, GFT, ORM, and IST systems
+3. **Semantic Analysis**: SemanticAgent processes operational events data to identify patterns related to the impersonation feature
+4. **Data Processing**: REPLAgent performs data transformations and analysis
+5. **Cross-Reference**: SemanticAgent joins datasets to verify application statuses and access controls
+6. **Verification**: Each step is verified by the SupervisorAgent before proceeding
+7. **Report Generation**: ReportAgent synthesizes all findings into a comprehensive investigation report
 
+## Technical Implementation Details
 
-⸻
+### Global State Management
+- Centralized state storage ensures data consistency across all agents
+- All agents read from and write to the shared global state
+- State management enables tracking of investigation progress and intermediate results
 
-Conclusion
+### Agent Communication Protocol
+- SupervisorAgent acts as the central communication hub
+- Agents communicate through the global state rather than direct inter-agent communication
+- Structured request/response patterns ensure reliable agent coordination
 
-This solution transforms incident investigation from a largely manual, ad hoc process into a highly automated, explainable, and efficient system. By combining LLM-powered semantic analysis with custom code execution and a modular agent architecture, it enables organizations to quickly and accurately investigate risk events, produce detailed reports, and maintain full auditability—with humans always in control for final review and approval.
+### Error Handling and Resilience
+- Each agent maintains its execution status for reliability
+- Failed operations can be retried without affecting the overall investigation
+- Partial results are preserved to enable investigation continuation
 
-⸻
+### Natural Language Processing
+- Semantic operations leverage advanced NLP capabilities
+- Natural language specifications are translated into appropriate data operations
+- Context-aware processing ensures accurate interpretation of user intent
 
-Ready for implementation or need further technical/architectural mapping? Let me know!
+## Benefits and Advantages
+
+### Efficiency Gains
+- Automated execution significantly reduces manual investigation time
+- Parallel agent processing enables faster completion of complex investigations
+- Semantic operations eliminate the need for complex query writing
+
+### Accuracy Improvements
+- Systematic approach ensures comprehensive coverage of investigation areas
+- Automated verification reduces human error
+- Consistent methodology across different types of investigations
+
+### Scalability
+- Multi-agent architecture supports handling multiple concurrent investigations
+- Modular design allows for easy addition of new agent types and capabilities
+- Semantic operators provide flexible adaptation to new investigation requirements
+
+### User Experience
+- Natural language interface reduces technical barriers
+- Human-in-the-loop design maintains user control and oversight
+- Comprehensive reporting provides actionable insights and clear next steps
+
+## Future Enhancements
+
+### Potential Expansions
+- Additional agent types for specialized data sources
+- Enhanced semantic operations for more complex data manipulations
+- Integration with additional external systems and APIs
+- Advanced visualization capabilities for investigation results
+
+### Continuous Improvement
+- Machine learning integration for pattern recognition and anomaly detection
+- Automated plan optimization based on historical investigation outcomes
+- Enhanced natural language understanding for more intuitive user interactions
+
+This AI-Assisted Investigation System represents a significant advancement in automated investigation capabilities, combining the power of AI agents with human oversight to deliver comprehensive, accurate, and efficient investigation results.
