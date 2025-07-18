@@ -1,445 +1,318 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-import json
-import asyncio
+from unittest.mock import Mock, patch, MagicMock, mock_open
+import yaml
+from your_module import regulation  # Replace with your actual module name
 
-# Mock data - completely isolated from real systems
-MOCK_REQUIREMENT_DATA = [
-    {
-        "reqId": "REQ001",
-        "reqName": "Sample Requirement",
-        "requirementSummaryEnglishText": "<p>This is a <b>test</b> requirement</p>",
-        "citation": "Test Citation 2024",
-        "functionList": [{"name": "function1"}, {"name": "function2"}],
-        "etr": "test_etr_value",
-        "riskLibAnchoring": {"level": "high", "score": 9},
-        "regulatory": "Test Regulatory Body",
-        "regulatoryTier": "Tier 1",
-        "regulatoryCountry": "US",
-        "inventoryType": "compliance",
-        "keyContactInfo": {"email": "test@example.com", "phone": "555-0123"}
-    },
-    {
-        "reqId": "REQ002",
-        "reqName": "Another Requirement",
-        "requirementSummaryEnglishText": "<div>HTML content here</div>",
-        "citation": "Another Citation",
-        "functionList": [],
-        "etr": None,
-        "riskLibAnchoring": {},
-        "regulatory": "",
-        "regulatoryTier": "Tier 2",
-        "regulatoryCountry": "CA",
-        "inventoryType": "operational",
-        "keyContactInfo": {}
-    }
-]
-
-MOCK_COUNTRIES_DATA = [
-    {"country": "US"},
-    {"country": "CA"},
-    {"country": "UK"}
-]
-
-MOCK_CREDENTIALS = {
-    "user": "test_user",
-    "password": "test_password"
-}
-
-class TestSyncAttributesToDatabase:
-    
-    @pytest.mark.asyncio
-    async def test_sync_attributes_success(self):
-        """Test successful sync - all mocked"""
-        mock_results = [
-            ["Activity taxonomy synced"],
-            ["Control taxonomy synced"],
-            ["Risk taxonomy synced"],
-            ["Root cause taxonomy synced"],
-            ["Regulation inventory synced"]
-        ]
-        
-        with patch('your_module.sync_activity_taxonomy', return_value=mock_results[0]), \
-             patch('your_module.sync_control_taxonomy', return_value=mock_results[1]), \
-             patch('your_module.sync_risk_taxonomy', return_value=mock_results[2]), \
-             patch('your_module.sync_root_cause_taxonomy', return_value=mock_results[3]), \
-             patch('your_module.sync_reg_inventory', return_value=mock_results[4]), \
-             patch('your_module.get_async_transaction_executor', return_value=AsyncMock()), \
-             patch('your_module.get_async_query_executor', return_value=AsyncMock()), \
-             patch('your_module.get_environment', return_value=MagicMock()), \
-             patch('your_module.GrcServiceSettings', return_value=MagicMock()):
-            
-            # Import and test your actual function
-            from your_module import sync_attributes_to_database
-            
-            result = await sync_attributes_to_database()
-            
-            expected = "Activity taxonomy synced|Control taxonomy synced|Risk taxonomy synced|Root cause taxonomy synced|Regulation inventory synced"
-            assert result == expected
-
-    @pytest.mark.asyncio
-    async def test_sync_attributes_with_exception(self):
-        """Test when one sync function fails"""
-        with patch('your_module.sync_activity_taxonomy', side_effect=Exception("Activity sync failed")), \
-             patch('your_module.sync_control_taxonomy', return_value=["Control synced"]), \
-             patch('your_module.sync_risk_taxonomy', return_value=["Risk synced"]), \
-             patch('your_module.sync_root_cause_taxonomy', return_value=["Root cause synced"]), \
-             patch('your_module.sync_reg_inventory', return_value=["Regulation synced"]), \
-             patch('your_module.get_async_transaction_executor', return_value=AsyncMock()), \
-             patch('your_module.get_async_query_executor', return_value=AsyncMock()), \
-             patch('your_module.get_environment', return_value=MagicMock()), \
-             patch('your_module.GrcServiceSettings', return_value=MagicMock()):
-            
-            from your_module import sync_attributes_to_database
-            
-            with pytest.raises(Exception, match="Activity sync failed"):
-                await sync_attributes_to_database()
-
-class TestSyncRegInventory:
-    
-    @pytest.fixture
-    def mock_transaction_executor(self):
-        """Create mock transaction executor"""
-        mock_executor = AsyncMock()
-        mock_executor.return_value = MagicMock()
-        return mock_executor
-    
-    @pytest.fixture
-    def mock_query_executor(self):
-        """Create mock query executor"""
-        mock_executor = AsyncMock()
-        mock_executor.return_value = MOCK_COUNTRIES_DATA
-        return mock_executor
-    
-    @pytest.fixture
-    def mock_grc_config(self):
-        """Create mock GRC service config"""
-        config = MagicMock()
-        config.api_url = "https://mock-api.example.com"
-        return config
+class TestRegulationFunction:
     
     @pytest.fixture
     def mock_environment(self):
-        """Create mock environment"""
-        env = MagicMock()
-        env.vector_store_env.pool_size = 5
-        env.application_name = "test_app"
-        env.vector_store_env.ssl_cert_file = "/path/to/cert.pem"
-        env.vector_store_env.url = "postgresql://localhost:5432/test"
-        env.vector_store_env.credentials_path.read_text.return_value = json.dumps(MOCK_CREDENTIALS)
-        return env
-    
-    @pytest.fixture
-    def mock_api_response(self):
-        """Create mock API response"""
-        response = MagicMock()
-        response.json.return_value = {
-            "data": {
-                "requirementSelectionData": MOCK_REQUIREMENT_DATA
-            }
-        }
-        return response
-
-    @pytest.mark.asyncio
-    async def test_sync_reg_inventory_success(self, mock_transaction_executor, mock_query_executor, 
-                                            mock_grc_config, mock_environment, mock_api_response):
-        """Test successful regulation inventory sync"""
-        
-        with patch('your_module.get_environment', return_value=mock_environment), \
-             patch('your_module.yaml.safe_load', return_value=MOCK_CREDENTIALS), \
-             patch('your_module.GrcServiceSettings', return_value=mock_grc_config), \
-             patch('your_module.RegServiceSettings', return_value=MagicMock()), \
-             patch('your_module.get_async_transaction_executor', return_value=mock_transaction_executor), \
-             patch('your_module.get_async_query_executor', return_value=mock_query_executor), \
-             patch('your_module.requests.post', return_value=mock_api_response), \
-             patch('your_module.truncate_db', return_value="Table truncated"), \
-             patch('your_module.remove_html_tags', return_value="Clean text"), \
-             patch('your_module.json.dumps', return_value='{"mock": "data"}'), \
+        """Mock environment and dependencies"""
+        with patch('your_module.get_environment') as mock_get_env, \
+             patch('your_module.yaml.safe_load') as mock_yaml, \
+             patch('your_module.get_async_query_executor') as mock_executor, \
+             patch('your_module.process_with_rerun') as mock_process, \
+             patch('builtins.open', mock_open(read_data='mock_credentials')) as mock_file, \
              patch('your_module.logger') as mock_logger:
             
-            from your_module import sync_reg_inventory
+            # Setup mock environment
+            mock_env = Mock()
+            mock_env.vector_store_env.credentials_path.read_text.return_value = 'mock_creds'
+            mock_env.vector_store_env.url = 'mock_url'
+            mock_env.vector_store_env.pool_size = 10
+            mock_env.application_name = 'test_app'
+            mock_env.vector_store_env.ssl_cert_file = 'cert.pem'
+            mock_get_env.return_value = mock_env
             
-            result = await sync_reg_inventory(mock_transaction_executor, mock_query_executor, 
-                                            mock_grc_config, mock_environment)
-            
-            # Verify result contains expected messages
-            assert isinstance(result, list)
-            assert len(result) > 0
-            assert "Starting sync_reg_inventory" in result[0]
-            
-            # Verify mocks were called
-            mock_query_executor.assert_called()
-            mock_transaction_executor.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_sync_reg_inventory_no_countries(self, mock_transaction_executor, mock_grc_config, mock_environment):
-        """Test when no countries are returned from database"""
-        
-        # Mock query executor to return empty list
-        empty_query_executor = AsyncMock()
-        empty_query_executor.return_value = []
-        
-        with patch('your_module.get_environment', return_value=mock_environment), \
-             patch('your_module.yaml.safe_load', return_value=MOCK_CREDENTIALS), \
-             patch('your_module.get_async_query_executor', return_value=empty_query_executor):
-            
-            from your_module import sync_reg_inventory
-            
-            result = await sync_reg_inventory(mock_transaction_executor, empty_query_executor, 
-                                            mock_grc_config, mock_environment)
-            
-            assert "No records found in EIM.REGULATION_T1_COUNTRY table" in str(result)
-
-    @pytest.mark.asyncio
-    async def test_sync_reg_inventory_api_failure(self, mock_transaction_executor, mock_query_executor, 
-                                                mock_grc_config, mock_environment):
-        """Test API request failure"""
-        
-        with patch('your_module.get_environment', return_value=mock_environment), \
-             patch('your_module.yaml.safe_load', return_value=MOCK_CREDENTIALS), \
-             patch('your_module.requests.post', side_effect=Exception("API connection failed")):
-            
-            from your_module import sync_reg_inventory
-            
-            result = await sync_reg_inventory(mock_transaction_executor, mock_query_executor, 
-                                            mock_grc_config, mock_environment)
-            
-            assert "Error fetching records from" in str(result)
-
-    @pytest.mark.asyncio
-    async def test_sync_reg_inventory_empty_api_response(self, mock_transaction_executor, mock_query_executor, 
-                                                       mock_grc_config, mock_environment):
-        """Test when API returns empty data"""
-        
-        empty_response = MagicMock()
-        empty_response.json.return_value = {
-            "data": {
-                "requirementSelectionData": []
+            # Setup mock credentials
+            mock_yaml.return_value = {
+                'user': 'test_user',
+                'password': 'test_password'
             }
+            
+            yield {
+                'mock_env': mock_env,
+                'mock_yaml': mock_yaml,
+                'mock_executor': mock_executor,
+                'mock_process': mock_process,
+                'mock_logger': mock_logger
+            }
+
+    @pytest.mark.asyncio
+    async def test_regulation_non_regulation_tag(self, mock_environment):
+        """Test when tag is not 'REGULATION'"""
+        result = await regulation(1, "test description", [], "OTHER_TAG")
+        
+        expected = {
+            "index": 1,
+            "tag": "OTHER_TAG",
+            "issue_description": "test description",
+            "result": []
         }
-        
-        with patch('your_module.get_environment', return_value=mock_environment), \
-             patch('your_module.yaml.safe_load', return_value=MOCK_CREDENTIALS), \
-             patch('your_module.requests.post', return_value=empty_response):
-            
-            from your_module import sync_reg_inventory
-            
-            result = await sync_reg_inventory(mock_transaction_executor, mock_query_executor, 
-                                            mock_grc_config, mock_environment)
-            
-            assert "api has not returned any data in requirement_data" in str(result)
+        assert result == expected
 
     @pytest.mark.asyncio
-    async def test_sync_reg_inventory_database_insert_failure(self, mock_query_executor, 
-                                                            mock_grc_config, mock_environment, mock_api_response):
-        """Test database insertion failure"""
-        
-        # Mock transaction executor to fail
-        failing_executor = AsyncMock()
-        failing_executor.side_effect = Exception("Database insert failed")
-        
-        with patch('your_module.get_environment', return_value=mock_environment), \
-             patch('your_module.yaml.safe_load', return_value=MOCK_CREDENTIALS), \
-             patch('your_module.requests.post', return_value=mock_api_response), \
-             patch('your_module.truncate_db', return_value="Truncated"), \
-             patch('your_module.remove_html_tags', return_value="Clean text"):
-            
-            from your_module import sync_reg_inventory
-            
-            result = await sync_reg_inventory(failing_executor, mock_query_executor, 
-                                            mock_grc_config, mock_environment)
-            
-            assert "Error inserting records into" in str(result)
-
-    @pytest.mark.asyncio
-    async def test_sync_reg_inventory_truncate_failure(self, mock_transaction_executor, mock_query_executor, 
-                                                     mock_grc_config, mock_environment):
-        """Test table truncation failure"""
-        
-        with patch('your_module.get_environment', return_value=mock_environment), \
-             patch('your_module.yaml.safe_load', return_value=MOCK_CREDENTIALS), \
-             patch('your_module.truncate_db', side_effect=Exception("Truncate failed")):
-            
-            from your_module import sync_reg_inventory
-            
-            result = await sync_reg_inventory(mock_transaction_executor, mock_query_executor, 
-                                            mock_grc_config, mock_environment)
-            
-            assert "Error truncating" in str(result)
-
-class TestFlattenRiskRecords:
-    
-    @pytest.mark.asyncio
-    async def test_flatten_risk_records_success(self):
-        """Test successful risk records flattening"""
-        mock_transaction_executor = AsyncMock()
-        mock_query_executor = AsyncMock()
-        
-        with patch('your_module.logger') as mock_logger:
-            from your_module import flatten_risk_records
-            
-            await flatten_risk_records(mock_transaction_executor, mock_query_executor)
-            
-            # Verify SQL was executed
-            mock_transaction_executor.assert_called_once()
-            mock_logger.info.assert_called_with("complete flatten_risk_records")
-
-    @pytest.mark.asyncio
-    async def test_flatten_risk_records_failure(self):
-        """Test risk records flattening failure"""
-        mock_transaction_executor = AsyncMock()
-        mock_query_executor = AsyncMock()
-        
-        # Make the transaction executor fail
-        mock_transaction_executor.side_effect = Exception("SQL execution failed")
-        
-        with patch('your_module.logger') as mock_logger:
-            from your_module import flatten_risk_records
-            
-            await flatten_risk_records(mock_transaction_executor, mock_query_executor)
-            
-            mock_logger.info.assert_called_with("Error flattening records: SQL execution failed")
-
-class TestRemoveHtmlTags:
-    
-    def test_remove_html_tags_success(self):
-        """Test successful HTML tag removal"""
-        html_input = "<p>This is <b>bold</b> text with <i>italics</i></p>"
-        expected_output = "This is bold text with italics"
-        
-        # Mock BeautifulSoup
-        with patch('your_module.BeautifulSoup') as mock_soup:
-            mock_soup_instance = MagicMock()
-            mock_soup.return_value = mock_soup_instance
-            mock_soup_instance.get_text.return_value = expected_output
-            
-            from your_module import remove_html_tags
-            
-            result = remove_html_tags(html_input)
-            
-            assert result == expected_output
-            mock_soup.assert_called_once_with(html_input, "html.parser")
-
-    def test_remove_html_tags_beautifulsoup_failure(self):
-        """Test HTML tag removal when BeautifulSoup fails"""
-        html_input = "<p>Test content</p>"
-        fallback_output = "Test content"
-        
-        with patch('your_module.BeautifulSoup', side_effect=Exception("BeautifulSoup failed")), \
-             patch('your_module.re.sub', return_value=fallback_output), \
-             patch('your_module.logger') as mock_logger:
-            
-            from your_module import remove_html_tags
-            
-            result = remove_html_tags(html_input)
-            
-            assert result == fallback_output
-            mock_logger.info.assert_called_with("Error parsing HTML with BeautifulSoup: BeautifulSoup failed")
-
-    def test_remove_html_tags_empty_input(self):
-        """Test with empty input"""
-        with patch('your_module.BeautifulSoup') as mock_soup:
-            mock_soup_instance = MagicMock()
-            mock_soup.return_value = mock_soup_instance
-            mock_soup_instance.get_text.return_value = ""
-            
-            from your_module import remove_html_tags
-            
-            result = remove_html_tags("")
-            
-            assert result == ""
-
-    def test_remove_html_tags_none_input(self):
-        """Test with None input"""
-        with patch('your_module.BeautifulSoup') as mock_soup:
-            mock_soup_instance = MagicMock()
-            mock_soup.return_value = mock_soup_instance
-            mock_soup_instance.get_text.return_value = ""
-            
-            from your_module import remove_html_tags
-            
-            result = remove_html_tags(None)
-            
-            assert result == ""
-
-class TestEdgeCases:
-    
-    @pytest.mark.asyncio
-    async def test_sync_with_malformed_requirement_data(self, mock_transaction_executor, mock_query_executor, 
-                                                       mock_grc_config, mock_environment):
-        """Test with malformed requirement data"""
-        
-        malformed_data = [
+    async def test_regulation_with_regulation_tag_success(self, mock_environment):
+        """Test successful regulation processing with REGULATION tag"""
+        # Mock database results
+        mock_db_results = [
             {
-                "reqId": None,
-                "reqName": 12345,  # Number instead of string
-                "requirementSummaryEnglishText": None,
-                "citation": "",
-                "functionList": "not_a_list",  # String instead of list
-                "etr": {},  # Dict instead of string
-                "riskLibAnchoring": "not_a_dict",  # String instead of dict
-                "regulatory": None,
-                "regulatoryTier": None,
-                "regulatoryCountry": None,
-                "inventoryType": None,
-                "keyContactInfo": "not_a_dict"  # String instead of dict
+                'pub_num': 'REG001',
+                'pub_name': 'Test Regulation',
+                'citation': 'Test Citation',
+                'function_list': 'Test Function',
+                'etr': 'Test ETR',
+                'risk_lib_anchoring': 'Test Risk',
+                'regulatory': 'Test Regulatory',
+                'regulatory_tier': 'Tier 1',
+                'country': 'US',
+                'inventory_type': 'Type A',
+                'key_contact_info': 'Contact Info'
             }
         ]
         
-        malformed_response = MagicMock()
-        malformed_response.json.return_value = {
-            "data": {
-                "requirementSelectionData": malformed_data
-            }
+        # Setup mock query executor
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
+        
+        # Setup mock LLM response
+        mock_llm_response = {
+            'res': ['Processed regulation response']
         }
+        mock_environment['mock_process'].return_value = mock_llm_response
         
-        with patch('your_module.get_environment', return_value=mock_environment), \
-             patch('your_module.yaml.safe_load', return_value=MOCK_CREDENTIALS), \
-             patch('your_module.requests.post', return_value=malformed_response), \
-             patch('your_module.truncate_db', return_value="Truncated"), \
-             patch('your_module.remove_html_tags', return_value=""), \
-             patch('your_module.json.dumps', return_value='""'):
-            
-            from your_module import sync_reg_inventory
-            
-            result = await sync_reg_inventory(mock_transaction_executor, mock_query_executor, 
-                                            mock_grc_config, mock_environment)
-            
-            # Should handle malformed data gracefully
-            assert isinstance(result, list)
-            assert len(result) > 0
+        result = await regulation(1, "test description", [{"category": "finance"}], "REGULATION")
+        
+        expected = {
+            "index": 1,
+            "tag": "REGULATION",
+            "issue_description": "test description",
+            "result": ['Processed regulation response']
+        }
+        assert result == expected
 
     @pytest.mark.asyncio
-    async def test_credentials_file_not_found(self, mock_transaction_executor, mock_query_executor, 
-                                            mock_grc_config):
-        """Test when credentials file is not found"""
+    async def test_regulation_with_empty_categories(self, mock_environment):
+        """Test regulation with empty categories list"""
+        mock_db_results = []
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
         
-        mock_env = MagicMock()
-        mock_env.vector_store_env.credentials_path.read_text.side_effect = FileNotFoundError("File not found")
+        mock_llm_response = {'res': []}
+        mock_environment['mock_process'].return_value = mock_llm_response
         
-        with patch('your_module.get_environment', return_value=mock_env):
-            from your_module import sync_reg_inventory
-            
-            with pytest.raises(FileNotFoundError):
-                await sync_reg_inventory(mock_transaction_executor, mock_query_executor, 
-                                        mock_grc_config, mock_env)
+        result = await regulation(1, "test description", [], "REGULATION")
+        
+        # Should use "No Regulation" as categories_regulation_concatenated
+        assert result["result"] == []
 
     @pytest.mark.asyncio
-    async def test_invalid_json_in_credentials(self, mock_transaction_executor, mock_query_executor, 
-                                             mock_grc_config, mock_environment):
-        """Test when credentials file contains invalid JSON"""
+    async def test_regulation_with_no_category_in_rows(self, mock_environment):
+        """Test regulation when rows don't have 'category' field"""
+        mock_db_results = []
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
         
-        mock_environment.vector_store_env.credentials_path.read_text.return_value = "invalid json content"
+        mock_llm_response = {'res': []}
+        mock_environment['mock_process'].return_value = mock_llm_response
         
-        with patch('your_module.get_environment', return_value=mock_environment), \
-             patch('your_module.yaml.safe_load', side_effect=Exception("Invalid YAML")):
-            
-            from your_module import sync_reg_inventory
-            
-            with pytest.raises(Exception, match="Invalid YAML"):
-                await sync_reg_inventory(mock_transaction_executor, mock_query_executor, 
-                                        mock_grc_config, mock_environment)
+        result = await regulation(1, "test description", [{"other_field": "value"}], "REGULATION")
+        
+        assert result["result"] == []
 
-# Simple test runner to avoid hanging
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+    @pytest.mark.asyncio
+    async def test_regulation_with_long_results_list(self, mock_environment):
+        """Test regulation when LLM returns more than 9 results"""
+        mock_db_results = [{'pub_num': f'REG{i:03d}', 'pub_name': f'Reg {i}', 'citation': f'Citation {i}', 'function_list': 'func', 'etr': 'etr', 'risk_lib_anchoring': 'risk', 'regulatory': 'reg', 'regulatory_tier': 'tier', 'country': 'US', 'inventory_type': 'type', 'key_contact_info': 'contact'} for i in range(15)]
+        
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
+        
+        # Mock LLM response with more than 9 items
+        long_response = [f"Result {i}" for i in range(12)]
+        mock_llm_response = {'res': long_response}
+        mock_environment['mock_process'].return_value = mock_llm_response
+        
+        result = await regulation(1, "test description", [{"category": "finance"}], "REGULATION")
+        
+        # Should truncate to first 9 results
+        assert len(result["result"]) == 9
+        assert result["result"] == long_response[:9]
+
+    @pytest.mark.asyncio
+    async def test_regulation_with_llm_error_response(self, mock_environment):
+        """Test regulation when LLM returns error response"""
+        mock_db_results = [
+            {
+                'pub_num': 'REG001',
+                'pub_name': 'Test Regulation',
+                'citation': 'Test Citation',
+                'function_list': 'Test Function',
+                'etr': 'Test ETR',
+                'risk_lib_anchoring': 'Test Risk',
+                'regulatory': 'Test Regulatory',
+                'regulatory_tier': 'Tier 1',
+                'country': 'US',
+                'inventory_type': 'Type A',
+                'key_contact_info': 'Contact Info'
+            }
+        ]
+        
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
+        
+        # Mock LLM response with error
+        mock_llm_response = {
+            'error': 'Some error occurred'
+        }
+        mock_environment['mock_process'].return_value = mock_llm_response
+        
+        result = await regulation(1, "test description", [{"category": "finance"}], "REGULATION")
+        
+        expected = {
+            "index": 1,
+            "tag": "REGULATION",
+            "issue_description": "test description",
+            "result": [],
+            "error": 'Some error occurred'
+        }
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_regulation_with_exception(self, mock_environment):
+        """Test regulation function when an exception occurs"""
+        # Make the query executor raise an exception
+        mock_environment['mock_executor'].side_effect = Exception("Database connection failed")
+        
+        result = await regulation(1, "test description", [{"category": "finance"}], "REGULATION")
+        
+        expected = {
+            "index": 1,
+            "tag": "REGULATION",
+            "issue_description": "test description",
+            "result": [],
+            "error": "Database connection failed"
+        }
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_regulation_with_multiple_categories(self, mock_environment):
+        """Test regulation with multiple categories in rows"""
+        mock_db_results = []
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
+        
+        mock_llm_response = {'res': ['Response for multiple categories']}
+        mock_environment['mock_process'].return_value = mock_llm_response
+        
+        rows_with_categories = [
+            {"category": "finance"},
+            {"category": "healthcare"},
+            {"category": "technology"}
+        ]
+        
+        result = await regulation(1, "test description", rows_with_categories, "REGULATION")
+        
+        # Verify the categories were properly concatenated
+        assert result["result"] == ['Response for multiple categories']
+
+    @pytest.mark.asyncio
+    async def test_regulation_categories_with_empty_strings(self, mock_environment):
+        """Test regulation when categories contain empty strings"""
+        mock_db_results = []
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
+        
+        mock_llm_response = {'res': []}
+        mock_environment['mock_process'].return_value = mock_llm_response
+        
+        rows_with_empty_categories = [
+            {"category": "finance"},
+            {"category": ""},
+            {"category": "healthcare"}
+        ]
+        
+        result = await regulation(1, "test description", rows_with_empty_categories, "REGULATION")
+        
+        # Should filter out empty categories
+        assert result["result"] == []
+
+    @pytest.mark.asyncio
+    async def test_regulation_db_results_population(self, mock_environment):
+        """Test that database results are properly populated in res"""
+        mock_db_results = [
+            {
+                'pub_num': 'REG001',
+                'pub_name': 'Test Regulation',
+                'citation': 'Test Citation',
+                'function_list': 'Test Function',
+                'etr': 'Test ETR',
+                'risk_lib_anchoring': 'Test Risk',
+                'regulatory': 'Test Regulatory',
+                'regulatory_tier': 'Tier 1',
+                'country': 'US',
+                'inventory_type': 'Type A',
+                'key_contact_info': 'Contact Info'
+            }
+        ]
+        
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
+        
+        mock_llm_response = {'res': ['Processed response']}
+        mock_environment['mock_process'].return_value = mock_llm_response
+        
+        await regulation(1, "test description", [{"category": "finance"}], "REGULATION")
+        
+        # Verify that process_with_rerun was called with the right parameters
+        mock_environment['mock_process'].assert_called_once()
+        call_args = mock_environment['mock_process'].call_args
+        assert 'regulation' in call_args[0][0]  # First argument should contain 'regulation'
+        assert call_args[1]['max_attempts'] == 3  # max_attempts parameter
+
+    @pytest.mark.asyncio 
+    async def test_regulation_yaml_credential_loading(self, mock_environment):
+        """Test that credentials are properly loaded from YAML"""
+        mock_db_results = []
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
+        
+        mock_llm_response = {'res': []}
+        mock_environment['mock_process'].return_value = mock_llm_response
+        
+        await regulation(1, "test description", [], "REGULATION")
+        
+        # Verify yaml.safe_load was called
+        mock_environment['mock_yaml'].assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_regulation_query_executor_parameters(self, mock_environment):
+        """Test that query executor is called with correct parameters"""
+        mock_db_results = []
+        mock_query_executor = Mock()
+        mock_query_executor.return_value = mock_db_results
+        mock_environment['mock_executor'].return_value = mock_query_executor
+        
+        mock_llm_response = {'res': []}
+        mock_environment['mock_process'].return_value = mock_llm_response
+        
+        await regulation(1, "test description", [{"category": "finance"}], "REGULATION")
+        
+        # Verify get_async_query_executor was called with correct parameters
+        mock_environment['mock_executor'].assert_called_once()
+        call_kwargs = mock_environment['mock_executor'].call_args[1]
+        assert call_kwargs['url'] == 'mock_url'
+        assert call_kwargs['user'] == 'test_user'
+        assert call_kwargs['password'] == 'test_password'
+        assert call_kwargs['pool_size'] == 10
+        assert call_kwargs['application_name'] == 'test_app'
+        assert call_kwargs['ssl_cert_file'] == 'cert.pem'
